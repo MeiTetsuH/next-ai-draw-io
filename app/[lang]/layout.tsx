@@ -78,12 +78,12 @@ export async function generateMetadata({
         authors: [{ name: "Next AI Draw.io" }],
         creator: "Next AI Draw.io",
         publisher: "Next AI Draw.io",
-        metadataBase: new URL("https://next-ai-drawio.jiang.jp"),
+        metadataBase: new URL("https://drawio.mingzhe.uk"),
         openGraph: {
             title: titles[lang],
             description: descriptions[lang],
             type: "website",
-            url: "https://next-ai-drawio.jiang.jp",
+            url: "https://drawio.mingzhe.uk",
             siteName: "Next AI Draw.io",
             locale:
                 lang === "zh"
@@ -109,11 +109,11 @@ export async function generateMetadata({
             images: ["/architecture.png"],
         },
         robots: {
-            index: true,
-            follow: true,
+            index: false,
+            follow: false,
             googleBot: {
-                index: true,
-                follow: true,
+                index: false,
+                follow: false,
                 "max-video-preview": -1,
                 "max-image-preview": "large",
                 "max-snippet": -1,
@@ -153,7 +153,7 @@ export default async function RootLayout({
         operatingSystem: "Web Browser",
         description:
             "AI-powered diagram generator with targeted XML editing capabilities that integrates with draw.io for creating AWS architecture diagrams, flowcharts, and technical diagrams. Features diagram history, multi-provider AI support, and real-time collaboration.",
-        url: "https://next-ai-drawio.jiang.jp",
+        url: "https://drawio.mingzhe.uk",
         inLanguage: validLang,
         offers: {
             "@type": "Offer",
