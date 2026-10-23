@@ -1,16 +1,15 @@
 import fs from "fs/promises"
 import path from "path"
 import { z } from "zod"
-import type { ProviderName } from "@/lib/types/model-config"
-import { PROVIDER_INFO } from "@/lib/types/model-config"
+import { PROVIDERS, type ProviderName } from "@/lib/providers"
 
 export const ProviderNameSchema: z.ZodType<ProviderName> = z
     .string()
-    .refine((val): val is ProviderName => val in PROVIDER_INFO, {
+    .refine((val): val is ProviderName => Object.hasOwn(PROVIDERS, val), {
         message: "Invalid provider name",
     })
 
-export const ServerProviderSchema = z.object({
+const ServerProviderSchema = z.object({
     name: z.string().min(1),
     provider: ProviderNameSchema,
     models: z.array(z.string().min(1)),
@@ -30,7 +29,6 @@ export const ServerModelsConfigSchema = z.object({
     providers: z.array(ServerProviderSchema),
 })
 
-export type ServerProviderConfig = z.infer<typeof ServerProviderSchema>
 export type ServerModelsConfig = z.infer<typeof ServerModelsConfigSchema>
 
 export interface FlattenedServerModel {
@@ -82,7 +80,7 @@ function configFromCommaSeparatedAiModel(): ServerModelsConfig | null {
         )
         return null
     }
-    if (!(aiProvider in PROVIDER_INFO)) {
+    if (!Object.hasOwn(PROVIDERS, aiProvider)) {
         console.warn(
             `[server-model-config] AI_PROVIDER="${aiProvider}" is not a known provider; skipping multi-model fallback.`,
         )
@@ -103,7 +101,7 @@ function configFromCommaSeparatedAiModel(): ServerModelsConfig | null {
     return {
         providers: [
             {
-                name: PROVIDER_INFO[providerName]?.label || providerName,
+                name: PROVIDERS[providerName].label,
                 provider: providerName,
                 models,
                 default: true,
@@ -153,23 +151,12 @@ export async function loadRawServerModelsConfig(): Promise<ServerModelsConfig | 
 
     // Merge in providers managed via the admin panel (settings.json).
     // Dynamic import to avoid a module-init cycle with lib/admin/providers.
-    let adminConfig: ServerModelsConfig | null = null
-    try {
-        const { adminProvidersToConfig, loadAdminProviders } = await import(
-            "./admin/providers"
-        )
-        const adminProviders = loadAdminProviders()
-        if (adminProviders.length > 0) {
-            adminConfig = adminProvidersToConfig(adminProviders)
-        }
-    } catch (err) {
-        console.error(
-            "[server-model-config] Failed to load admin providers:",
-            err,
-        )
-    }
+    const { adminProvidersToConfig, loadAdminProviders } = await import(
+        "./admin/providers"
+    )
+    const adminConfig = adminProvidersToConfig(loadAdminProviders())
 
-    if (!adminConfig || adminConfig.providers.length === 0) return envConfig
+    if (adminConfig.providers.length === 0) return envConfig
     if (!envConfig) return adminConfig
 
     // A panel default overrides an env default
@@ -195,8 +182,7 @@ export async function loadFlattenedServerModels(): Promise<
     const seenIds = new Set<string>()
 
     for (const p of cfg.providers) {
-        const providerLabel =
-            p.name || PROVIDER_INFO[p.provider]?.label || p.provider
+        const providerLabel = p.name
 
         // Use slugified name for unique ID (supports multiple API keys per provider)
         const nameSlug = slugify(p.name)
@@ -245,8 +231,6 @@ export async function loadFlattenedServerModels(): Promise<
 export async function findServerModelById(
     modelId: string,
 ): Promise<FlattenedServerModel | null> {
-    if (!modelId.startsWith("server:")) return null
-
     const models = await loadFlattenedServerModels()
     return models.find((m) => m.id === modelId) || null
 }

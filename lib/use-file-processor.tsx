@@ -2,6 +2,7 @@
 
 import { useState } from "react"
 import { toast } from "sonner"
+import { formatMessage } from "@/lib/i18n/utils"
 import {
     extractPdfText,
     extractTextFileContent,
@@ -16,11 +17,17 @@ export interface FileData {
     isExtracting: boolean
 }
 
+/** Toast texts; {name}, {limit} and {size} are filled in */
+export interface FileProcessorMessages {
+    tooLong: string
+    readFailed: string
+}
+
 /**
  * Hook for processing file uploads, especially PDFs and text files.
  * Handles text extraction, character limit validation, and cleanup.
  */
-export function useFileProcessor() {
+export function useFileProcessor(messages: FileProcessorMessages) {
     const [files, setFiles] = useState<File[]>([])
     const [pdfData, setPdfData] = useState<Map<File, FileData>>(new Map())
 
@@ -58,9 +65,12 @@ export function useFileProcessor() {
 
                 // Check character limit
                 if (text.length > MAX_EXTRACTED_CHARS) {
-                    const limitK = MAX_EXTRACTED_CHARS / 1000
                     toast.error(
-                        `${file.name}: Content exceeds ${limitK}k character limit (${(text.length / 1000).toFixed(1)}k chars)`,
+                        formatMessage(messages.tooLong, {
+                            name: file.name,
+                            limit: MAX_EXTRACTED_CHARS / 1000,
+                            size: (text.length / 1000).toFixed(1),
+                        }),
                     )
                     setPdfData((prev) => {
                         const next = new Map(prev)
@@ -85,7 +95,9 @@ export function useFileProcessor() {
                 })
             } catch (error) {
                 console.error("Failed to extract text:", error)
-                toast.error(`Failed to read file: ${file.name}`)
+                toast.error(
+                    formatMessage(messages.readFailed, { name: file.name }),
+                )
                 setPdfData((prev) => {
                     const next = new Map(prev)
                     next.delete(file)

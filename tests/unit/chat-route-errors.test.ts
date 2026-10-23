@@ -18,18 +18,11 @@ const ENV = [
     "OLLAMA_API_KEY",
     "NEXT_AI_DRAWIO_DESKTOP",
 ]
-const saved: Record<string, string | undefined> = {}
-
 beforeEach(() => {
-    for (const k of ENV) saved[k] = process.env[k]
-    for (const k of ENV) delete process.env[k]
+    for (const k of ENV) vi.stubEnv(k, undefined)
 })
 
 afterEach(() => {
-    for (const k of ENV) {
-        if (saved[k] === undefined) delete process.env[k]
-        else process.env[k] = saved[k]
-    }
     vi.unstubAllGlobals()
 })
 
@@ -46,8 +39,10 @@ const providerAnswers = (status: number, body: string) =>
         ),
     )
 
-/** The error text the chat panel gets from the stream */
-async function streamedError(headers: Record<string, string>) {
+/** The error the chat panel gets from the stream */
+async function streamedError(
+    headers: Record<string, string>,
+): Promise<{ code: string; message: string }> {
     const res = await chat(
         new Request("http://localhost/api/chat", {
             method: "POST",
@@ -66,7 +61,9 @@ async function streamedError(headers: Record<string, string>) {
     )
     const text = await res.text()
     const line = text.split("\n").find((l) => l.includes('"type":"error"'))
-    return line ? JSON.parse(JSON.parse(line.slice(6)).errorText).message : ""
+    if (!line) throw new Error(`No error event in the stream:\n${text}`)
+    const { code, message } = JSON.parse(JSON.parse(line.slice(6)).errorText)
+    return { code, message }
 }
 
 describe("provider error texts in the stream", () => {
@@ -83,7 +80,7 @@ describe("provider error texts in the stream", () => {
                 })
             }),
         )
-        expect(await streamedError({})).toMatch(
+        expect((await streamedError({})).message).toMatch(
             /127\.0\.0\.1:11434|fetch failed/,
         )
         // The SDK retries a refused connection twice, waiting between
@@ -102,8 +99,8 @@ describe("provider error texts in the stream", () => {
                 })
             }),
         )
-        expect(await streamedError({})).not.toBe(
-            "The provider returned an error.",
+        expect((await streamedError({})).message).toMatch(
+            /10\.0\.0\.9:11434|fetch failed/,
         )
     }, 20_000)
 
@@ -119,12 +116,11 @@ describe("provider error texts in the stream", () => {
                 },
             }),
         )
-        expect(
-            await streamedError({
-                "x-ai-provider": "edgeone",
-                "x-ai-model": "@tx/deepseek-ai/deepseek-v3-0324",
-            }),
-        ).toMatch(/daily public quota/)
+        const { message } = await streamedError({
+            "x-ai-provider": "edgeone",
+            "x-ai-model": "@tx/deepseek-ai/deepseek-v3-0324",
+        })
+        expect(message).toMatch(/daily public quota/)
     })
 
     it("hides the provider's text on the server's own key", async () => {
@@ -137,16 +133,17 @@ describe("provider error texts in the stream", () => {
                 error: { message: "Organization org-operator is suspended" },
             }),
         )
-        const message = await streamedError({})
+        const { code, message } = await streamedError({})
         expect(message).not.toMatch(/org-operator/)
         // A 403 on the server's key gets its own hint and no message
+        expect(code).toBe("server_key_forbidden")
         expect(message).toBe("")
     })
 })
 
 describe("the output cap", () => {
     it("holds for the server's own keyless endpoints too", async () => {
-        process.env.MAX_OUTPUT_TOKENS = "8000"
+        vi.stubEnv("MAX_OUTPUT_TOKENS", "8000")
         const sent: string[] = []
         vi.stubGlobal(
             "fetch",
@@ -155,34 +152,30 @@ describe("the output cap", () => {
                 return new Response("{}", { status: 400 })
             }),
         )
-        try {
-            const res = await chat(
-                new Request("http://localhost/api/chat", {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "x-ai-provider": "ollama",
-                        "x-ai-base-url": "http://127.0.0.1:11434/api",
-                        "x-ai-model": "llama3",
-                        "x-max-output-tokens": "200000",
-                    },
-                    body: JSON.stringify({
-                        messages: [
-                            {
-                                id: "u1",
-                                role: "user",
-                                parts: [{ type: "text", text: "Draw" }],
-                            },
-                        ],
-                        xml: "",
-                    }),
+        const res = await chat(
+            new Request("http://localhost/api/chat", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "x-ai-provider": "ollama",
+                    "x-ai-base-url": "http://127.0.0.1:11434/api",
+                    "x-ai-model": "llama3",
+                    "x-max-output-tokens": "200000",
+                },
+                body: JSON.stringify({
+                    messages: [
+                        {
+                            id: "u1",
+                            role: "user",
+                            parts: [{ type: "text", text: "Draw" }],
+                        },
+                    ],
+                    xml: "",
                 }),
-            )
-            await res.text()
-            expect(sent[0]).toContain('"max_output_tokens":8000')
-        } finally {
-            delete process.env.MAX_OUTPUT_TOKENS
-        }
+            }),
+        )
+        await res.text()
+        expect(sent[0]).toContain('"max_output_tokens":8000')
     })
 })
 

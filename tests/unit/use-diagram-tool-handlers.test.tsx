@@ -10,6 +10,7 @@ const box = (id: string) =>
 function setup(partialXml: string) {
     const refs = {
         partialXmlRef: { current: partialXml },
+        continuationOriginalRef: { current: null },
         // A failed edit's preview is still on the canvas, its original kept
         editDiagramOriginalXmlRef: {
             current: new Map([["edit-1", "<mxfile>original</mxfile>"]]),
@@ -19,30 +20,28 @@ function setup(partialXml: string) {
         chartXMLRef: { current: "" },
     }
     const onDisplayChart = vi.fn(
-        (_xml: string, _skipValidation?: boolean): string | null => null,
+        (
+            _xml: string,
+            _skipValidation?: boolean,
+            _mode?: string,
+        ): string | null => null,
     )
     const { result } = renderHook(() =>
         useDiagramToolHandlers({
             ...refs,
             onDisplayChart,
             onFetchChart: async () => "",
-            onExport: () => {},
             enableVlmValidation: false,
         }),
     )
     const addToolOutput = vi.fn()
-    const append = (xml: string) =>
+    const call = (toolName: string, input: object, toolCallId = "call-1") =>
         result.current.handleToolCall(
-            {
-                toolCall: {
-                    toolCallId: "append-1",
-                    toolName: "append_diagram",
-                    input: { xml },
-                },
-            },
+            { toolCall: { toolCallId, toolName, input } },
             addToolOutput,
         )
-    return { refs, onDisplayChart, addToolOutput, append }
+    const append = (xml: string) => call("append_diagram", { xml }, "append-1")
+    return { refs, onDisplayChart, addToolOutput, append, call }
 }
 
 describe("the screenshot check and Stop", () => {
@@ -57,13 +56,13 @@ describe("the screenshot check and Stop", () => {
         const { result } = renderHook(() =>
             useDiagramToolHandlers({
                 partialXmlRef: { current: "" },
+                continuationOriginalRef: { current: null },
                 editDiagramOriginalXmlRef: { current: new Map() },
                 processedToolCallsRef: { current: new Set() },
                 validationRetryCountRef: opts.retryCount ?? { current: 0 },
                 chartXMLRef: { current: "" },
                 onDisplayChart: () => null,
                 onFetchChart: async () => "",
-                onExport: () => {},
                 enableVlmValidation: true,
                 captureValidationPng:
                     opts.captureValidationPng ??
@@ -192,13 +191,176 @@ describe("append_diagram and the stored previews", () => {
         expect(refs.processedToolCallsRef.current.has("edit-1")).toBe(false)
     })
 
-    it("leaves them when the assembled diagram is invalid", async () => {
+    it("takes them when the assembled diagram is invalid, and goes back", async () => {
+        // Back to the diagram before the failed edit's preview, at once
         const { refs, onDisplayChart, addToolOutput, append } = setup(
             `<mxCell id="1" value="root id" vertex="1" parent="1">${geometry}</mxCell><mxCell id="3" value="3" vertex="1" parent="1"><mxGeometry x="0" y="0" width="8`,
         )
         await append('0" height="40" as="geometry"/></mxCell>')
-        expect(onDisplayChart).not.toHaveBeenCalled()
         expect(addToolOutput.mock.calls[0][0].state).toBe("output-error")
-        expect(refs.editDiagramOriginalXmlRef.current.size).toBe(1)
+        expect(onDisplayChart.mock.calls).toEqual([
+            ["<mxfile>original</mxfile>", true, "revert"],
+        ])
+        expect(refs.editDiagramOriginalXmlRef.current.size).toBe(0)
+        expect(refs.processedToolCallsRef.current.has("edit-1")).toBe(true)
+    })
+
+    it("goes back to the diagram before the cut off drawing when it fails", async () => {
+        // The failed edit's preview was drawn on the cut off drawing: its
+        // original must not come back later
+        const invalid = `<mxCell id="1" value="root id" vertex="1" parent="1">${geometry}</mxCell><mxCell id="3" value="3" vertex="1" parent="1"><mxGeometry x="0" y="0" width="8`
+        const { refs, onDisplayChart, append } = setup(invalid)
+        refs.continuationOriginalRef.current =
+            "<mxfile>before the cut</mxfile>" as any
+        refs.editDiagramOriginalXmlRef.current = new Map([
+            ["edit-1", "<mxfile>cut off</mxfile>"],
+        ])
+        await append('0" height="40" as="geometry"/></mxCell>')
+        const calls = onDisplayChart.mock.calls
+        expect(calls.at(-1)).toEqual([
+            "<mxfile>before the cut</mxfile>",
+            true,
+            "revert",
+        ])
+        expect(calls.some(([xml]) => xml === "<mxfile>cut off</mxfile>")).toBe(
+            false,
+        )
+        expect(refs.editDiagramOriginalXmlRef.current.size).toBe(0)
+        expect(refs.continuationOriginalRef.current).toBeNull()
+    })
+})
+
+describe("display_diagram and undo", () => {
+    it("commits the diagram as one undo step before any check", async () => {
+        const { onDisplayChart, call } = setup("")
+        await call("display_diagram", { xml: box("2") })
+        expect(onDisplayChart.mock.calls.map((c) => c[2])).toEqual(["commit"])
+    })
+})
+
+describe("a cut off drawing", () => {
+    it("is replaced starting from the diagram before it", async () => {
+        const { refs, onDisplayChart, call } = setup("")
+        // Cut off: its preview stays, the diagram before it is kept
+        await call(
+            "display_diagram",
+            { xml: `${box("2")}<mxCell id="3"` },
+            "d1",
+        )
+        expect(refs.continuationOriginalRef.current).toBe(
+            "<mxfile>original</mxfile>",
+        )
+        // A later drawing (after failed calls undone to the cut off one)
+        // first goes back to it, so its undo step starts there
+        await call("display_diagram", { xml: box("4") }, "d2")
+        expect(
+            onDisplayChart.mock.calls.map(([xml, , mode]) => [
+                xml === "<mxfile>original</mxfile>" ? "original" : "new",
+                mode,
+            ]),
+        ).toEqual([
+            ["original", "revert"],
+            ["new", "commit"],
+        ])
+        expect(refs.continuationOriginalRef.current).toBeNull()
+    })
+})
+
+describe("the model's page", () => {
+    const page = (id: string, cells: string) =>
+        `<diagram id="${id}" name="Page ${id}"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/>${cells}</root></mxGraphModel></diagram>`
+    const twoPages = `<mxfile>${page("a", box("A"))}${page("b", box("B"))}</mxfile>`
+    /** Ids of the shapes on a page (not the root cells) */
+    const shapesOn = (xml: string, pageId: string) =>
+        Array.from(
+            new DOMParser()
+                .parseFromString(xml, "text/xml")
+                .querySelectorAll(`diagram[id="${pageId}"] mxCell`),
+        )
+            .map((cell) => cell.getAttribute("id"))
+            .filter((id) => id !== "0" && id !== "1")
+
+    function setupOn(pageId: string | null) {
+        const onDisplayChart = vi.fn(
+            (
+                _xml: string,
+                _skipValidation?: boolean,
+                _mode?: string,
+                _meta?: object,
+            ): string | null => null,
+        )
+        const { result } = renderHook(() =>
+            useDiagramToolHandlers({
+                partialXmlRef: { current: "" },
+                continuationOriginalRef: { current: null },
+                editDiagramOriginalXmlRef: { current: new Map() },
+                processedToolCallsRef: { current: new Set() },
+                validationRetryCountRef: { current: 0 },
+                chartXMLRef: { current: twoPages },
+                turnPageIdRef: { current: pageId },
+                onDisplayChart,
+                onFetchChart: async () => twoPages,
+                enableVlmValidation: false,
+            }),
+        )
+        const addToolOutput = vi.fn()
+        const call = (toolName: string, input: object) =>
+            result.current.handleToolCall(
+                { toolCall: { toolCallId: "call-1", toolName, input } },
+                addToolOutput,
+            )
+        return { onDisplayChart, addToolOutput, call }
+    }
+
+    it("display_diagram draws on that page and keeps the others", async () => {
+        const { onDisplayChart, call } = setupOn("b")
+        await call("display_diagram", { xml: box("N") })
+        const [xml, , mode, meta] = onDisplayChart.mock.calls[0]
+        expect(mode).toBe("commit")
+        expect(meta).toEqual({ toolCallId: "call-1", pageId: "b" })
+        expect(shapesOn(xml, "a")).toEqual(["A"])
+        expect(shapesOn(xml, "b")).toEqual(["N"])
+        // The page keeps its own name
+        expect(xml).toContain('name="Page b"')
+    })
+
+    it("edit_diagram changes that page", async () => {
+        const { onDisplayChart, addToolOutput, call } = setupOn("b")
+        await call("edit_diagram", {
+            operations: [{ operation: "delete", cell_id: "B" }],
+        })
+        expect(addToolOutput.mock.lastCall?.[0].state).toBeUndefined()
+        const [xml] = onDisplayChart.mock.calls.at(-1) as [string]
+        expect(shapesOn(xml, "a")).toEqual(["A"])
+        expect(shapesOn(xml, "b")).toEqual([])
+    })
+
+    it("shows the model only its page when an edit fails", async () => {
+        const { addToolOutput, call } = setupOn("b")
+        await call("edit_diagram", {
+            operations: [{ operation: "delete", cell_id: "missing" }],
+        })
+        const output = addToolOutput.mock.lastCall?.[0]
+        expect(output?.state).toBe("output-error")
+        expect(output?.errorText).toContain('id="B"')
+        expect(output?.errorText).not.toContain('id="A"')
+    })
+
+    it("draws on the first page when the page is not known", async () => {
+        const { onDisplayChart, call } = setupOn(null)
+        await call("display_diagram", { xml: box("N") })
+        const [xml, , , meta] = onDisplayChart.mock.calls[0]
+        expect(meta).toEqual({ toolCallId: "call-1", pageId: null })
+        expect(shapesOn(xml, "a")).toEqual(["N"])
+        expect(shapesOn(xml, "b")).toEqual(["B"])
+    })
+
+    it("lets a drawing with several pages replace the document", async () => {
+        const { onDisplayChart, call } = setupOn("b")
+        const drawn = `<mxfile>${page("x", box("X"))}${page("y", box("Y"))}</mxfile>`
+        await call("display_diagram", { xml: drawn })
+        const [xml] = onDisplayChart.mock.calls[0]
+        expect(shapesOn(xml, "x")).toEqual(["X"])
+        expect(shapesOn(xml, "a")).toEqual([])
     })
 })

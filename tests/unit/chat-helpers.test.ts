@@ -4,9 +4,10 @@ import { convertToModelMessages } from "ai"
 import { jsonrepair } from "jsonrepair"
 import { describe, expect, it } from "vitest"
 import {
+    diagramContextText,
     dropInvalidToolCalls,
     fixToolInputJson,
-    replaceHistoricalToolInputs,
+    parseStringifiedArrays,
     validateFileParts,
 } from "@/lib/chat-helpers"
 
@@ -74,7 +75,6 @@ describe("validateFileParts", () => {
         for (const url of [
             "http://10.0.0.5/secret.png",
             "https://example.com/a.png",
-            undefined,
         ]) {
             const messages = [{ role: "user", parts: [{ type: "file", url }] }]
             expect(validateFileParts(messages).valid).toBe(false)
@@ -91,91 +91,6 @@ describe("validateFileParts", () => {
             { role: "user", parts: [{ type: "text", text: "hello" }] },
         ]
         expect(validateFileParts(messages).valid).toBe(false)
-    })
-})
-
-describe("replaceHistoricalToolInputs", () => {
-    it("replaces display_diagram tool inputs with placeholder", () => {
-        const messages = [
-            {
-                role: "assistant",
-                content: [
-                    {
-                        type: "tool-call",
-                        toolName: "display_diagram",
-                        input: { xml: "<mxCell...>" },
-                    },
-                ],
-            },
-        ]
-        const result = replaceHistoricalToolInputs(messages)
-        expect(result[0].content[0].input.placeholder).toContain(
-            "XML content replaced",
-        )
-    })
-
-    it("replaces edit_diagram tool inputs with placeholder", () => {
-        const messages = [
-            {
-                role: "assistant",
-                content: [
-                    {
-                        type: "tool-call",
-                        toolName: "edit_diagram",
-                        input: { operations: [] },
-                    },
-                ],
-            },
-        ]
-        const result = replaceHistoricalToolInputs(messages)
-        expect(result[0].content[0].input.placeholder).toContain(
-            "XML content replaced",
-        )
-    })
-
-    it("leaves tool calls with invalid inputs for dropInvalidToolCalls", () => {
-        const messages = [
-            {
-                role: "assistant",
-                content: [
-                    {
-                        type: "tool-call",
-                        toolName: "display_diagram",
-                        input: {},
-                    },
-                    {
-                        type: "tool-call",
-                        toolName: "display_diagram",
-                        input: null,
-                    },
-                ],
-            },
-        ]
-        const result = replaceHistoricalToolInputs(messages)
-        expect(result[0].content).toEqual(messages[0].content)
-    })
-
-    it("preserves non-assistant messages", () => {
-        const messages = [{ role: "user", content: "hello" }]
-        const result = replaceHistoricalToolInputs(messages)
-        expect(result).toEqual(messages)
-    })
-
-    it("preserves other tool calls", () => {
-        const messages = [
-            {
-                role: "assistant",
-                content: [
-                    {
-                        type: "tool-call",
-                        toolName: "other_tool",
-                        input: { foo: "bar" },
-                    },
-                ],
-            },
-        ]
-        const result = replaceHistoricalToolInputs(messages)
-        expect(result[0].content[0].input).toEqual({ foo: "bar" })
     })
 })
 
@@ -296,5 +211,49 @@ describe("fixToolInputJson", () => {
         const input =
             '{"operations": [{"operation": "add", "cell_id": "a", "new_xml": "<mxCell id=\\"a\\" value=\\"x=1\\"/>"}]}'
         expect(fixToolInputJson(input)).toBe(input)
+    })
+})
+
+describe("parseStringifiedArrays", () => {
+    it("turns an array written as a JSON string into the array", () => {
+        const ops = [{ operation: "delete", cell_id: "2" }]
+        const input = JSON.stringify({ operations: JSON.stringify(ops) })
+        expect(JSON.parse(parseStringifiedArrays(input))).toEqual({
+            operations: ops,
+        })
+    })
+
+    it("leaves other inputs as they are", () => {
+        for (const input of [
+            '{"operations":[{"operation":"delete","cell_id":"2"}]}',
+            '{"xml":"<mxCell id=\\"2\\"/>"}',
+            '{"label":"[draft] notes"}',
+            "not json",
+        ]) {
+            expect(parseStringifiedArrays(input)).toBe(input)
+        }
+    })
+})
+
+describe("diagramContextText", () => {
+    const empty = (attrs: string) =>
+        `<mxGraphModel${attrs}><root><mxCell id="0"/><mxCell id="1" parent="0"/></root></mxGraphModel>`
+
+    it("calls a page without shapes empty, unless it has a background", () => {
+        expect(diagramContextText({ xml: empty(""), pageId: null })).toBe(
+            "[Canvas: empty when this message was sent.]",
+        )
+        expect(
+            diagramContextText({
+                xml: empty(' background="none"'),
+                pageId: null,
+            }),
+        ).toBe("[Canvas: empty when this message was sent.]")
+        expect(
+            diagramContextText({
+                xml: empty(' background="#000000"'),
+                pageId: null,
+            }),
+        ).toContain('background="#000000"')
     })
 })

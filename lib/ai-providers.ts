@@ -22,17 +22,18 @@ import {
     loadAdminProviders,
 } from "@/lib/admin/providers"
 import { getEnvFallback } from "@/lib/admin/settings"
-import { isPrivateUrl, redirectGuardedFetch } from "@/lib/ssrf-protection"
 import {
-    normalizeBaseUrl,
-    ollamaApiUrl,
-    PROVIDER_INFO,
+    PROVIDER_NAMES,
+    PROVIDERS,
+    type ProviderDef,
     type ProviderName,
-} from "@/lib/types/model-config"
+    publicDefaultUrl,
+} from "@/lib/providers"
+import { isPrivateUrl, redirectGuardedFetch } from "@/lib/ssrf-protection"
+import { thinkingSwitchOf } from "@/lib/thinking-capabilities"
+import { normalizeBaseUrl, ollamaApiUrl } from "@/lib/types/model-config"
 
-export type { ProviderName }
-
-export const AIHUBMIX_APP_CODE = "MSBS9675"
+const AIHUBMIX_APP_CODE = "MSBS9675"
 
 interface ModelConfig {
     model: any
@@ -41,22 +42,11 @@ interface ModelConfig {
     provider: ProviderName
 }
 
-// Providers that only support a single system message
-export const SINGLE_SYSTEM_PROVIDERS = new Set<ProviderName>([
-    "minimax",
-    "glm",
-    "qwen",
-    "kimi",
-    "qiniu",
-    "novita",
-    "mimo",
-])
-
 /**
  * Normalize MiniMax base URL for AI SDK compatibility.
  * MiniMax supports Anthropic-compatible and OpenAI-compatible endpoints.
  */
-export function normalizeMiniMaxBaseURL(rawUrl: string): {
+function normalizeMiniMaxBaseURL(rawUrl: string): {
     baseURL: string
     isAnthropicCompatible: boolean
 } {
@@ -129,21 +119,37 @@ const BEDROCK_ANTHROPIC_BETA = {
  * @param userApiKey - User-provided API key (if any)
  * @param userBaseUrl - User-provided base URL (if any)
  * @param serverBaseUrl - Server's base URL from environment variable
- * @param defaultBaseUrl - Provider's official/default base URL (optional)
  * @returns The resolved base URL to use
  */
 export function resolveBaseURL(
     userApiKey: string | null | undefined,
     userBaseUrl: string | null | undefined,
     serverBaseUrl: string | undefined,
-    defaultBaseUrl?: string,
 ): string | undefined {
     if (userApiKey) {
-        // User provides their own API key - only use user's baseUrl or default
-        return userBaseUrl || defaultBaseUrl || undefined
+        // User provides their own API key - only use user's baseUrl
+        return userBaseUrl || undefined
     }
     // No user API key - fall back to server config
-    return userBaseUrl || serverBaseUrl || defaultBaseUrl || undefined
+    return userBaseUrl || serverBaseUrl || undefined
+}
+
+/** The provider record of a name that may not be one */
+function providerDef(name: string): ProviderDef | undefined {
+    return Object.hasOwn(PROVIDERS, name)
+        ? PROVIDERS[name as ProviderName]
+        : undefined
+}
+
+/**
+ * A key and whose it is: the client's own, or the server's. "server" also
+ * when the variable turns out empty, which the credential check reports.
+ */
+interface ResolvedKey {
+    value?: string
+    source: "client" | "server"
+    /** The apiKeyEnv entry drawn, when there were several */
+    selectedKeyEnv?: string
 }
 
 /**
@@ -159,9 +165,9 @@ export function resolveBaseURL(
  */
 function resolveApiKey(
     overrides: ClientOverrides | undefined,
-    defaultEnvVar: string,
-): string | undefined {
-    if (overrides?.apiKey) return overrides.apiKey
+    defaultEnvVar: string | undefined,
+): ResolvedKey {
+    if (overrides?.apiKey) return { value: overrides.apiKey, source: "client" }
 
     if (overrides?.apiKeyEnv) {
         // Handle array of env var names - randomly select one
@@ -176,23 +182,24 @@ function resolveApiKey(
                     validEnvVars[
                         Math.floor(Math.random() * validEnvVars.length)
                     ]
-                console.log(
-                    `[API Key Routing] Selected ${selectedEnvVar} from ${validEnvVars.length} available keys`,
-                )
-                return process.env[selectedEnvVar]
+                return {
+                    value: process.env[selectedEnvVar],
+                    source: "server",
+                    selectedKeyEnv: selectedEnvVar,
+                }
             }
         } else {
-            return process.env[overrides.apiKeyEnv]
+            return { value: process.env[overrides.apiKeyEnv], source: "server" }
         }
     }
 
-    return process.env[defaultEnvVar]
+    return {
+        value: defaultEnvVar ? process.env[defaultEnvVar] : undefined,
+        source: "server",
+    }
 }
 
-/**
- * Resolve base URL from custom env var name or default env var.
- * Supports multiple base URLs per provider via ai-models.json baseUrlEnv config.
- */
+/** The server's base URL: a server model's own variable (baseUrlEnv) or the default one */
 function resolveBaseUrlEnv(
     overrides: ClientOverrides | undefined,
     defaultEnvVar: string,
@@ -245,6 +252,39 @@ function googleSamplingSettings(): { topK?: number; topP?: number } {
 }
 
 /**
+ * Gemini 2.5/3 models think by default, but need includeThoughts: true to
+ * return the reasoning. The budget applies to Gemini 2.5, the level to
+ * Gemini 3. Shared by Google AI and Vertex AI, which read different variables.
+ */
+function geminiThinkingOptions(
+    modelId: string | undefined,
+    budgetEnvName: string,
+    levelEnvName: string,
+): { thinkingConfig: Record<string, any> } | undefined {
+    if (!modelId || !/gemini-?[23]/.test(modelId)) return undefined
+
+    const thinkingConfig: Record<string, any> = { includeThoughts: true }
+    const budget = parseIntSafe(
+        process.env[budgetEnvName],
+        budgetEnvName,
+        1024,
+        100000,
+    )
+    const level = process.env[levelEnvName] as
+        | "minimal"
+        | "low"
+        | "medium"
+        | "high"
+        | undefined
+    if (budget && (modelId.includes("2.5") || modelId.includes("2-5"))) {
+        thinkingConfig.thinkingBudget = budget
+    } else if (level && /gemini-?3/.test(modelId)) {
+        thinkingConfig.thinkingLevel = level
+    }
+    return { thinkingConfig }
+}
+
+/**
  * Build provider-specific options from environment variables
  * Supports various AI SDK providers with their unique configuration options
  *
@@ -271,41 +311,27 @@ function buildProviderOptions(
 
     switch (provider) {
         case "openai": {
-            const reasoningEffort = process.env.OPENAI_REASONING_EFFORT
-            const reasoningSummary = process.env.OPENAI_REASONING_SUMMARY
-
+            const reasoningEffort = process.env.OPENAI_REASONING_EFFORT as
+                | "minimal"
+                | "low"
+                | "medium"
+                | "high"
+                | undefined
             // Reasoning models (the o-series, gpt-5 and later) need
-            // reasoningSummary to return thoughts
-            if (modelId && /^(o\d|gpt-([5-9]|[1-9]\d))/.test(modelId)) {
-                options.openai = {
-                    // Auto-enable reasoning summary for reasoning models
-                    // Use 'auto' as default since not all models support 'detailed'
-                    reasoningSummary:
-                        (reasoningSummary as "auto" | "detailed") || "auto",
-                }
+            // reasoningSummary to return thoughts; 'auto' as the default
+            // since not all models support 'detailed'
+            const isReasoning =
+                !!modelId && /^(o\d|gpt-([5-9]|[1-9]\d))/.test(modelId)
+            const reasoningSummary =
+                (process.env.OPENAI_REASONING_SUMMARY as
+                    | "auto"
+                    | "detailed"
+                    | undefined) || (isReasoning ? "auto" : undefined)
 
-                // Optionally configure reasoning effort
-                if (reasoningEffort) {
-                    options.openai.reasoningEffort = reasoningEffort as
-                        | "minimal"
-                        | "low"
-                        | "medium"
-                        | "high"
-                }
-            } else if (reasoningEffort || reasoningSummary) {
-                // Non-reasoning models: only apply if explicitly configured
-                options.openai = {}
-                if (reasoningEffort) {
-                    options.openai.reasoningEffort = reasoningEffort as
-                        | "minimal"
-                        | "low"
-                        | "medium"
-                        | "high"
-                }
-                if (reasoningSummary) {
-                    options.openai.reasoningSummary = reasoningSummary as
-                        | "auto"
-                        | "detailed"
+            if (reasoningSummary || reasoningEffort) {
+                options.openai = {
+                    ...(reasoningSummary && { reasoningSummary }),
+                    ...(reasoningEffort && { reasoningEffort }),
                 }
             }
             break
@@ -333,85 +359,21 @@ function buildProviderOptions(
         }
 
         case "google": {
-            const thinkingBudgetVal = parseIntSafe(
-                process.env.GOOGLE_THINKING_BUDGET,
+            const google = geminiThinkingOptions(
+                modelId,
                 "GOOGLE_THINKING_BUDGET",
-                1024,
-                100000,
+                "GOOGLE_THINKING_LEVEL",
             )
-            const thinkingLevel = process.env.GOOGLE_THINKING_LEVEL
-
-            // Google Gemini 2.5/3 models think by default, but need includeThoughts: true
-            // to return the reasoning in the response
-            if (
-                modelId &&
-                (modelId.includes("gemini-2") ||
-                    modelId.includes("gemini-3") ||
-                    modelId.includes("gemini2") ||
-                    modelId.includes("gemini3"))
-            ) {
-                const thinkingConfig: Record<string, any> = {
-                    includeThoughts: true,
-                }
-
-                // Optionally configure thinking budget or level
-                if (
-                    thinkingBudgetVal &&
-                    (modelId.includes("2.5") || modelId.includes("2-5"))
-                ) {
-                    thinkingConfig.thinkingBudget = thinkingBudgetVal
-                } else if (
-                    thinkingLevel &&
-                    (modelId.includes("gemini-3") ||
-                        modelId.includes("gemini3"))
-                ) {
-                    thinkingConfig.thinkingLevel = thinkingLevel as
-                        | "low"
-                        | "high"
-                }
-
-                options.google = { thinkingConfig }
-            }
+            if (google) options.google = google
             break
         }
         case "vertexai": {
-            const thinkingBudget = parseIntSafe(
-                process.env.GOOGLE_VERTEX_THINKING_BUDGET,
+            const google = geminiThinkingOptions(
+                modelId,
                 "GOOGLE_VERTEX_THINKING_BUDGET",
-                1024,
-                100000,
+                "GOOGLE_VERTEX_THINKING_LEVEL",
             )
-            const thinkingLevel = process.env.GOOGLE_VERTEX_THINKING_LEVEL
-
-            if (
-                modelId &&
-                (modelId.includes("gemini-2") ||
-                    modelId.includes("gemini-3") ||
-                    modelId.includes("gemini2") ||
-                    modelId.includes("gemini3"))
-            ) {
-                const thinkingConfig: Record<string, any> = {
-                    includeThoughts: true,
-                }
-
-                const isGemini3 =
-                    modelId?.includes("gemini-3") ||
-                    modelId?.includes("gemini3")
-                const isGemini25 =
-                    modelId?.includes("2.5") || modelId?.includes("2-5")
-
-                if (isGemini3 && thinkingLevel) {
-                    // Vertex AI provider in AI SDK supports more granular levels (minimal/low/medium/high)
-                    thinkingConfig.thinkingLevel = thinkingLevel as
-                        | "minimal"
-                        | "low"
-                        | "medium"
-                        | "high"
-                } else if (isGemini25 && thinkingBudget) {
-                    thinkingConfig.thinkingBudget = thinkingBudget
-                }
-                options.google = { thinkingConfig }
-            }
+            if (google) options.google = google
             break
         }
         case "azure": {
@@ -497,32 +459,199 @@ function buildProviderOptions(
     return Object.keys(options).length > 0 ? options : undefined
 }
 
-// Map of provider to required environment variable
-export const PROVIDER_ENV_VARS: Record<ProviderName, string | null> = {
-    bedrock: null, // AWS SDK auto-uses IAM role on AWS, or env vars locally
-    openai: "OPENAI_API_KEY",
-    anthropic: "ANTHROPIC_API_KEY",
-    google: "GOOGLE_GENERATIVE_AI_API_KEY",
-    vertexai: "GOOGLE_VERTEX_API_KEY",
-    azure: "AZURE_API_KEY",
-    ollama: null, // No credentials needed for local Ollama
-    openrouter: "OPENROUTER_API_KEY",
-    aihubmix: "AIHUBMIX_API_KEY",
-    deepseek: "DEEPSEEK_API_KEY",
-    siliconflow: "SILICONFLOW_API_KEY",
-    sglang: "SGLANG_API_KEY",
-    gateway: "AI_GATEWAY_API_KEY",
-    edgeone: null, // No credentials needed - uses EdgeOne Edge AI
-    doubao: "DOUBAO_API_KEY",
-    modelscope: "MODELSCOPE_API_KEY",
-    glm: "GLM_API_KEY",
-    qwen: "QWEN_API_KEY",
-    qiniu: "QINIU_API_KEY",
-    kimi: "KIMI_API_KEY",
-    minimax: "MINIMAX_API_KEY",
-    novita: "NOVITA_API_KEY",
-    mimo: "MIMO_API_KEY",
-    atlascloud: "ATLASCLOUD_API_KEY",
+/**
+ * The provider options with the user's thinking switch applied, for a model
+ * that has one (lib/thinking-capabilities.ts). With thinking on, a budget
+ * or effort set in the environment still applies.
+ */
+export function applyThinkingSwitch(
+    providerOptions: Record<string, any> | undefined,
+    provider: ProviderName,
+    modelId: string,
+    enabled: boolean,
+): Record<string, any> | undefined {
+    const kind = thinkingSwitchOf(provider, modelId)
+    if (!kind) return providerOptions
+    const options = { ...providerOptions }
+
+    switch (kind) {
+        case "effort": {
+            const key = provider === "azure" ? "azure" : "openai"
+            // A summary has nothing to summarize without reasoning
+            const { reasoningSummary, ...rest } = options[key] ?? {}
+            options[key] = enabled
+                ? {
+                      ...options[key],
+                      reasoningEffort: rest.reasoningEffort ?? "medium",
+                  }
+                : { ...rest, reasoningEffort: "none" }
+            break
+        }
+        case "budget":
+        case "adaptive": {
+            const key = provider === "bedrock" ? "bedrock" : "anthropic"
+            const field = key === "bedrock" ? "reasoningConfig" : "thinking"
+            const { [field]: fromEnv, ...rest } = options[key] ?? {}
+            // The environment's budget if it set one, and only that: its type
+            // may say disabled, and BEDROCK_REASONING_EFFORT alone gives
+            // Claude a config without a budget, which does not think at all.
+            // Opus 4.7 and later return no thinking text unless asked to.
+            const on = fromEnv?.budgetTokens
+                ? { type: "enabled", budgetTokens: fromEnv.budgetTokens }
+                : kind === "adaptive"
+                  ? { type: "adaptive", display: "summarized" }
+                  : { type: "enabled", budgetTokens: 1024 }
+            // Claude Sonnet 5 and Opus 5 think when the request says
+            // nothing, so off is said explicitly. Bedrock's SDK does not
+            // send it for Claude, so it goes in the request fields.
+            options[key] = enabled
+                ? { ...rest, [field]: on }
+                : key === "anthropic"
+                  ? { ...rest, thinking: { type: "disabled" } }
+                  : {
+                        ...rest,
+                        additionalModelRequestFields: {
+                            ...rest.additionalModelRequestFields,
+                            thinking: { type: "disabled" },
+                        },
+                    }
+            break
+        }
+        case "gemini": {
+            // Flash thinks by default with a budget it picks, Flash-Lite
+            // only with a budget; -1 lets the model pick
+            const config = options.google?.thinkingConfig ?? {}
+            options.google = {
+                ...options.google,
+                thinkingConfig: enabled
+                    ? {
+                          ...config,
+                          includeThoughts: true,
+                          thinkingBudget: config.thinkingBudget ?? -1,
+                      }
+                    : { thinkingBudget: 0 },
+            }
+            break
+        }
+        case "nova":
+            options.bedrock = {
+                ...options.bedrock,
+                reasoningConfig: enabled
+                    ? {
+                          type: "enabled",
+                          maxReasoningEffort:
+                              options.bedrock?.reasoningConfig
+                                  ?.maxReasoningEffort ?? "medium",
+                      }
+                    : { type: "disabled" },
+            }
+            break
+        case "deepseek":
+            options.deepseek = {
+                thinking: { type: enabled ? "enabled" : "disabled" },
+            }
+            break
+    }
+
+    return Object.keys(options).length > 0 ? options : undefined
+}
+
+/**
+ * The names of a provider's server key and base URL variables, from the
+ * record: <PREFIX>_API_KEY (or the record's own keyEnv) and <PREFIX>_BASE_URL.
+ * Empty for Bedrock and EdgeOne. Always the spelling; whether the server
+ * must have the key is serverCredentialError's question.
+ */
+export function envVarsOf(provider: ProviderName): {
+    apiKey?: string
+    baseUrl?: string
+} {
+    const { envPrefix, keyEnv } = PROVIDERS[provider]
+    if (envPrefix === null) return {}
+    return {
+        apiKey: keyEnv ?? `${envPrefix}_API_KEY`,
+        baseUrl: `${envPrefix}_BASE_URL`,
+    }
+}
+
+// The key variable the server must have for each provider; null where it
+// needs none of this kind: Bedrock (the AWS SDK uses an IAM role or the
+// AWS_* variables), local Ollama, EdgeOne (the site's own function)
+const REQUIRED_KEY_VARS = Object.fromEntries(
+    PROVIDER_NAMES.map((p) => {
+        const { credential } = PROVIDERS[p]
+        const required = credential === "apiKey" || credential === "vertexKey"
+        return [p, required ? (envVarsOf(p).apiKey ?? null) : null]
+    }),
+) as Record<ProviderName, string | null>
+
+/**
+ * Why the server lacks this provider's credentials, or null when it has
+ * them. detectProvider asks for null; validateProviderCredentials throws
+ * the text. In order: an array apiKeyEnv passes when any of its variables
+ * has a value, and nothing else is checked; without a custom variable a
+ * provider with an altKeyEnv (Anthropic's ANTHROPIC_AUTH_TOKEN) accepts
+ * either variable; a custom variable without a value fails, with no fall
+ * back to the default one; a provider with a resourceNameEnv (Azure) then
+ * needs its base URL variable, the server model's own URL variable or the
+ * resource name. Providers with no required key variable pass unless a
+ * custom variable was given.
+ */
+function serverCredentialError(
+    provider: ProviderName,
+    customApiKeyEnv?: string | string[],
+    customBaseUrlEnv?: string,
+): string | null {
+    if (Array.isArray(customApiKeyEnv)) {
+        const hasAnyKey = customApiKeyEnv.some((envVar) => process.env[envVar])
+        if (!hasAnyKey) {
+            return (
+                `At least one of [${customApiKeyEnv.join(", ")}] environment variables is required for ${provider} provider. ` +
+                `Please set at least one in your .env.local file.`
+            )
+        }
+        return null
+    }
+
+    const { altKeyEnv, resourceNameEnv } = PROVIDERS[provider]
+    const requiredKeyEnv = REQUIRED_KEY_VARS[provider]
+    if (altKeyEnv && !customApiKeyEnv) {
+        const hasCredential = !!(
+            (requiredKeyEnv && process.env[requiredKeyEnv]) ||
+            process.env[altKeyEnv]
+        )
+        if (!hasCredential) {
+            return (
+                `Either ${requiredKeyEnv} or ${altKeyEnv} environment variable is required for ${provider} provider. ` +
+                `Please set one in your .env.local file.`
+            )
+        }
+    } else {
+        const requiredVar = customApiKeyEnv || requiredKeyEnv
+        if (requiredVar && !process.env[requiredVar]) {
+            return (
+                `${requiredVar} environment variable is required for ${provider} provider. ` +
+                `Please set it in your .env.local file.`
+            )
+        }
+    }
+
+    // The SDK builds the URL from the resource name when there is no URL.
+    // Only Azure has one, and the text stays as it was (tests freeze it)
+    if (resourceNameEnv) {
+        const baseUrlEnv = envVarsOf(provider).baseUrl as string
+        const hasBaseUrl =
+            !!process.env[baseUrlEnv] ||
+            !!(customBaseUrlEnv && process.env[customBaseUrlEnv])
+        const hasResourceName = !!process.env[resourceNameEnv]
+        if (!hasBaseUrl && !hasResourceName) {
+            return (
+                `Azure requires either ${baseUrlEnv} or ${resourceNameEnv} to be set. ` +
+                `Please set one in your .env.local file.`
+            )
+        }
+    }
+    return null
 }
 
 /**
@@ -530,40 +659,11 @@ export const PROVIDER_ENV_VARS: Record<ProviderName, string | null> = {
  * Returns the provider if exactly one is configured, otherwise null
  */
 function detectProvider(): ProviderName | null {
-    const configuredProviders: ProviderName[] = []
-
-    for (const [provider, envVar] of Object.entries(PROVIDER_ENV_VARS)) {
-        if (envVar === null) {
-            // Skip ollama - it doesn't require credentials
-            continue
-        }
-        // Anthropic accepts ANTHROPIC_AUTH_TOKEN (Bearer auth) as alternative to ANTHROPIC_API_KEY
-        const hasCredential =
-            provider === "anthropic"
-                ? !!(
-                      process.env.ANTHROPIC_API_KEY ||
-                      process.env.ANTHROPIC_AUTH_TOKEN
-                  )
-                : !!process.env[envVar]
-        if (hasCredential) {
-            // Azure requires additional config (baseURL or resourceName)
-            if (provider === "azure") {
-                const hasBaseUrl = !!process.env.AZURE_BASE_URL
-                const hasResourceName = !!process.env.AZURE_RESOURCE_NAME
-                if (hasBaseUrl || hasResourceName) {
-                    configuredProviders.push(provider as ProviderName)
-                }
-            } else {
-                configuredProviders.push(provider as ProviderName)
-            }
-        }
-    }
-
-    if (configuredProviders.length === 1) {
-        return configuredProviders[0]
-    }
-
-    return null
+    const configuredProviders = PROVIDER_NAMES.filter(
+        (p) =>
+            REQUIRED_KEY_VARS[p] !== null && serverCredentialError(p) === null,
+    )
+    return configuredProviders.length === 1 ? configuredProviders[0] : null
 }
 
 /**
@@ -576,54 +676,12 @@ function validateProviderCredentials(
     customApiKeyEnv?: string | string[],
     customBaseUrlEnv?: string,
 ): void {
-    // Handle array of env var names - at least one must be set
-    if (Array.isArray(customApiKeyEnv)) {
-        const hasAnyKey = customApiKeyEnv.some((envVar) => process.env[envVar])
-        if (!hasAnyKey) {
-            throw new Error(
-                `At least one of [${customApiKeyEnv.join(", ")}] environment variables is required for ${provider} provider. ` +
-                    `Please set at least one in your .env.local file.`,
-            )
-        }
-        return
-    }
-
-    // Anthropic accepts ANTHROPIC_AUTH_TOKEN (Bearer auth) as alternative to ANTHROPIC_API_KEY
-    if (provider === "anthropic" && !customApiKeyEnv) {
-        const hasCredential = !!(
-            process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN
-        )
-        if (!hasCredential) {
-            throw new Error(
-                `Either ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN environment variable is required for anthropic provider. ` +
-                    `Please set one in your .env.local file.`,
-            )
-        }
-    } else {
-        // Use custom env var name if provided, otherwise use default
-        const requiredVar = customApiKeyEnv || PROVIDER_ENV_VARS[provider]
-        if (requiredVar && !process.env[requiredVar]) {
-            throw new Error(
-                `${requiredVar} environment variable is required for ${provider} provider. ` +
-                    `Please set it in your .env.local file.`,
-            )
-        }
-    }
-
-    // Azure requires either AZURE_BASE_URL or AZURE_RESOURCE_NAME in addition
-    // to API key, or a server model's own URL variable (an admin panel entry)
-    if (provider === "azure") {
-        const hasBaseUrl =
-            !!process.env.AZURE_BASE_URL ||
-            !!(customBaseUrlEnv && process.env[customBaseUrlEnv])
-        const hasResourceName = !!process.env.AZURE_RESOURCE_NAME
-        if (!hasBaseUrl && !hasResourceName) {
-            throw new Error(
-                `Azure requires either AZURE_BASE_URL or AZURE_RESOURCE_NAME to be set. ` +
-                    `Please set one in your .env.local file.`,
-            )
-        }
-    }
+    const error = serverCredentialError(
+        provider,
+        customApiKeyEnv,
+        customBaseUrlEnv,
+    )
+    if (error) throw new Error(error)
 }
 
 /** AWS's Bedrock endpoint for a region, as the Bedrock SDK builds it */
@@ -640,30 +698,250 @@ function bedrockRuntimeUrl(region: string): string {
     return `https://bedrock-runtime.${region}.${suffix}`
 }
 
-/**
- * Providers whose SDK has the official endpoint built in. The others are
- * OpenAI-compatible APIs (or Anthropic) that are called at
- * PROVIDER_INFO.defaultBaseUrl unless a base URL is configured.
- */
-const SDK_KNOWS_ENDPOINT = new Set<ProviderName>([
-    "openai",
-    "google",
-    "azure",
-    "openrouter",
-    "gateway",
-    "deepseek",
-])
+type KeySource = "client" | "server" | "none"
 
 /** Where and how to call a provider, once credentials are resolved */
 interface Endpoint {
     apiKey?: string
+    /** Anthropic Bearer auth (ANTHROPIC_AUTH_TOKEN), server only */
+    authToken?: string
+    /** Azure, the server's resource only */
+    resourceName?: string
+    /** undefined: the SDK's built-in endpoint */
     baseURL?: string
+    /** The URL came from the client or a server variable, not the record */
+    configuredBaseURL: boolean
+    /** A client-chosen, untrusted URL: wrap fetch in redirectGuardedFetch */
+    guarded: boolean
+    /** "server" is what usesServerCredentials answers true for */
+    keySource: KeySource
+    /** The apiKeyEnv entry drawn (array case); getAIModel logs it */
+    selectedKeyEnv?: string
     headers?: Record<string, string>
+    /** Set by getAIModel from guarded; resolveEndpoint never fills it */
     fetch?: typeof fetch
-    authToken?: string // Anthropic Bearer auth
-    resourceName?: string // Azure
-    // baseURL comes from the settings or env, not the provider's default
-    configuredBaseURL?: boolean
+}
+
+/**
+ * Whose key a call uses and where it goes, by the provider's credential
+ * kind. Reads its arguments and process.env, draws one key with Math.random
+ * when apiKeyEnv is an array, and never throws, fetches or logs: getAIModel
+ * decides what a missing key or URL means, usesServerCredentials reads
+ * keySource. overrides.baseUrl must already be normalized (normalizeBaseUrl
+ * drops one pasted endpoint path per call, so it runs once, in the caller).
+ * Bedrock gets only keySource: bedrockModel() builds its SDK parameters.
+ */
+function resolveEndpoint(
+    provider: ProviderName,
+    overrides?: ClientOverrides,
+): Endpoint {
+    const def = PROVIDERS[provider]
+    const vars = envVarsOf(provider)
+    const clientUrl = overrides?.baseUrl || undefined
+    // Requests to a base URL the client chose must not follow redirects. A
+    // trusted URL is the server's own (the admin Test of an entry without
+    // one), not a user's
+    const guarded = !!clientUrl && !overrides?.trustedBaseUrl
+
+    switch (def.credential) {
+        case "aws": {
+            // The client's own Bedrock API key or access key pair, else the
+            // server's (the admin panel's ADMIN_AWS_* keys or an IAM role)
+            const clientKeys = !!(
+                overrides?.apiKey ||
+                (overrides?.awsAccessKeyId && overrides?.awsSecretAccessKey)
+            )
+            return {
+                configuredBaseURL: false,
+                guarded,
+                keySource: clientKeys ? "client" : "server",
+            }
+        }
+        case "vertexKey": {
+            // SECURITY: a client base URL only ever gets the client's key, so
+            // the server's key is never sent to a client-chosen host. A client
+            // key only goes to the client's URL or the official one.
+            const apiKey = clientUrl
+                ? overrides?.vertexApiKey || undefined
+                : overrides?.vertexApiKey || process.env[vars.apiKey as string]
+            const baseURL = resolveBaseURL(
+                overrides?.vertexApiKey,
+                clientUrl,
+                process.env[vars.baseUrl as string],
+            )
+            return {
+                apiKey,
+                baseURL,
+                configuredBaseURL: !!baseURL,
+                guarded,
+                keySource: overrides?.vertexApiKey ? "client" : "server",
+            }
+        }
+        case "none":
+            // The site's own function (EdgeOne), an OpenAI-compatible API
+            // without a key. The route passes the site's absolute URL and the
+            // cookies and access code that authenticate the call.
+            return {
+                apiKey: "edgeone",
+                baseURL: clientUrl || "/api/edgeai",
+                headers: overrides?.headers,
+                configuredBaseURL: !!clientUrl,
+                guarded,
+                keySource: "none",
+            }
+        case "optionalKey": {
+            // SECURITY: with a client base URL only the client's key is used,
+            // never the server's (Ollama). A user's key never goes to the
+            // server's URL: without a URL of their own it goes to the
+            // provider's cloud. The server's key goes to the server's URL
+            // variable (or a server model's own), else to the SDK's local
+            // default.
+            const key: ResolvedKey = clientUrl
+                ? { value: overrides?.apiKey || undefined, source: "client" }
+                : resolveApiKey(overrides, vars.apiKey)
+            const baseURL =
+                clientUrl ||
+                (overrides?.apiKey
+                    ? def.defaultBaseUrl
+                    : resolveBaseUrlEnv(overrides, vars.baseUrl as string))
+            // Only a server key costs money; a keyless local server or the
+            // client's own server does not. Spelled out because resolveApiKey
+            // says "server" for an empty variable too.
+            const serverKey =
+                overrides?.apiKeyEnv || process.env[vars.apiKey as string]
+            const keySource: KeySource = overrides?.apiKey
+                ? "client"
+                : !clientUrl && serverKey
+                  ? "server"
+                  : "none"
+            return {
+                apiKey: key.value,
+                baseURL,
+                configuredBaseURL: !!baseURL,
+                guarded,
+                keySource,
+                selectedKeyEnv: key.selectedKeyEnv,
+            }
+        }
+        case "apiKey": {
+            // An API key and a base URL from <PREFIX>_API_KEY /
+            // <PREFIX>_BASE_URL, or a server model's apiKeyEnv / baseUrlEnv
+            const key = resolveApiKey(overrides, vars.apiKey)
+            const configuredUrl = resolveBaseURL(
+                overrides?.apiKey,
+                clientUrl,
+                resolveBaseUrlEnv(overrides, vars.baseUrl as string),
+            )
+            // Without a configured URL an SDK that knows its endpoint gets
+            // none, except OpenAI with a user's key: the SDK would read the
+            // server's OPENAI_BASE_URL, so the official endpoint is named.
+            // The others get the record's https default (a local default,
+            // SGLang's 127.0.0.1, only fills the settings form).
+            const baseURL =
+                configuredUrl ||
+                (def.sdkKnowsEndpoint &&
+                !(def.sdk === "openai" && overrides?.apiKey)
+                    ? undefined
+                    : publicDefaultUrl(provider))
+            return {
+                apiKey: key.value,
+                baseURL,
+                configuredBaseURL: !!configuredUrl,
+                guarded,
+                keySource: key.source,
+                selectedKeyEnv: key.selectedKeyEnv,
+                // Bearer auth when there is no API key (Anthropic)
+                authToken:
+                    def.altKeyEnv && !key.value
+                        ? process.env[def.altKeyEnv]
+                        : undefined,
+                // Only the server's own resource; a client key needs its URL
+                // (Azure)
+                resourceName:
+                    def.resourceNameEnv && !overrides?.apiKey
+                        ? process.env[def.resourceNameEnv]
+                        : undefined,
+            }
+        }
+    }
+}
+
+/**
+ * A Bedrock model from the client's credentials if it sent any (a Bedrock
+ * API key, or an access key pair), else the admin panel's ADMIN_AWS_* keys,
+ * else the default AWS credential chain (an IAM role, the AWS_* variables).
+ */
+function bedrockModel(
+    modelId: string,
+    overrides: ClientOverrides | undefined,
+): LanguageModel {
+    const clientApiKey = overrides?.apiKey
+    const hasClientCredentials =
+        overrides?.awsAccessKeyId && overrides?.awsSecretAccessKey
+    // Keys from the admin panel. The ADMIN_ names keep them out of the
+    // default AWS credential chain, which other clients such as the
+    // DynamoDB quota manager use with their own credentials.
+    const adminAccessKeyId = process.env.ADMIN_AWS_ACCESS_KEY_ID
+    const adminSecretAccessKey = process.env.ADMIN_AWS_SECRET_ACCESS_KEY
+    // The region becomes part of the endpoint's host name, so a
+    // request's region must be a region name, or it could send the
+    // server's credentials to another host
+    if (
+        overrides?.awsRegion &&
+        !/^[a-z]{2,4}(-[a-z]+)+-\d{1,2}$/.test(overrides.awsRegion)
+    ) {
+        throw Object.assign(
+            new Error(`Invalid AWS region "${overrides.awsRegion}"`),
+            { statusCode: 400 },
+        )
+    }
+    const bedrockRegion =
+        overrides?.awsRegion ||
+        process.env.ADMIN_AWS_REGION ||
+        process.env.AWS_REGION ||
+        "us-west-2"
+
+    const bedrockProvider = clientApiKey
+        ? createAmazonBedrock({
+              region: bedrockRegion,
+              apiKey: clientApiKey,
+              // The SDK falls back to signing with AWS keys when it
+              // drops a key (one of spaces): never the server's
+              credentialProvider: async () => {
+                  throw new Error("The Bedrock API key is empty")
+              },
+              // Without a baseURL it reads the server's
+              // AWS_ENDPOINT_URL_BEDROCK_RUNTIME / AWS_ENDPOINT_URL
+              baseURL: bedrockRuntimeUrl(bedrockRegion),
+          })
+        : hasClientCredentials
+          ? createAmazonBedrock({
+                region: bedrockRegion,
+                accessKeyId: overrides.awsAccessKeyId as string,
+                secretAccessKey: overrides.awsSecretAccessKey as string,
+                ...(overrides?.awsSessionToken && {
+                    sessionToken: overrides.awsSessionToken,
+                }),
+                // Without an apiKey the SDK reads the server's
+                // AWS_BEARER_TOKEN_BEDROCK, which wins over the keys
+                apiKey: "",
+                // Without a baseURL it reads the server's
+                // AWS_ENDPOINT_URL_BEDROCK_RUNTIME / AWS_ENDPOINT_URL
+                baseURL: bedrockRuntimeUrl(bedrockRegion),
+            })
+          : adminAccessKeyId && adminSecretAccessKey
+            ? createAmazonBedrock({
+                  region: bedrockRegion,
+                  accessKeyId: adminAccessKeyId,
+                  secretAccessKey: adminSecretAccessKey,
+                  // The keys the admin panel's Test button checked
+                  apiKey: "",
+              })
+            : createAmazonBedrock({
+                  region: bedrockRegion,
+                  credentialProvider: fromNodeProviderChain(),
+              })
+    return bedrockProvider(modelId)
 }
 
 /**
@@ -690,7 +968,10 @@ function compatibleModel(
     })
 }
 
-/** Create the model for a provider. Credentials are already resolved. */
+/**
+ * Create the model for a provider with its endpoint resolved, by the SDK
+ * the record names. Bedrock never comes here: getAIModel calls bedrockModel.
+ */
 function createModel(
     provider: ProviderName,
     modelId: string,
@@ -701,7 +982,7 @@ function createModel(
         ...(e.baseURL && { baseURL: e.baseURL }),
         ...(e.fetch && { fetch: e.fetch }),
     }
-    switch (provider) {
+    switch (PROVIDERS[provider].sdk) {
         case "openai": {
             const openaiProvider = createOpenAI(opts)
             // A configured base URL is usually a proxy that only has Chat
@@ -746,8 +1027,6 @@ function createModel(
             // Without a key or URL the SDK uses Vercel's endpoint and OIDC
             return createGateway(opts)(modelId)
         case "deepseek":
-        case "kimi":
-        case "mimo":
             // Kimi and MiMo return reasoning_content like DeepSeek and need it
             // passed back in multi-turn tool calls (MiMo answers 400 otherwise)
             return createDeepSeek(opts)(modelId)
@@ -777,10 +1056,21 @@ function createModel(
                   })(modelId)
                 : compatibleModel(provider, modelId, { ...e, baseURL })
         }
-        default:
-            // siliconflow, sglang, modelscope, glm, qwen, qiniu, novita,
-            // atlascloud, edgeone
+        case "vertex":
+            // Express Mode: an API key; the URL only when one is configured
+            return createVertex(opts)(modelId)
+        case "ollama":
+            return createOllama({
+                ...(e.baseURL && { baseURL: ollamaApiUrl(e.baseURL) }),
+                ...(e.apiKey && {
+                    headers: { Authorization: `Bearer ${e.apiKey}` },
+                }),
+                ...(e.fetch && { fetch: e.fetch }),
+            })(modelId)
+        case "openai-compatible":
             return compatibleModel(provider, modelId, e)
+        case "bedrock":
+            throw new Error("Bedrock models come from bedrockModel()")
     }
 }
 
@@ -801,18 +1091,27 @@ export function getAIModel(clientOverrides?: ClientOverrides): ModelConfig {
     // SECURITY: Prevent SSRF attacks (GHSA-9qf7-mprq-9qgm)
     // If a custom baseUrl is provided, an API key MUST also be provided.
     // This prevents attackers from redirecting server API keys to malicious endpoints.
-    // Exception: EdgeOne doesn't require API keys.
-    // Ollama is exempt only when no server OLLAMA_API_KEY is configured;
-    // when it IS configured, the outer guard also enforces client apiKey for custom baseUrls.
+    // Exceptions, by the provider's credential kind: a provider without keys
+    // (EdgeOne); a Vertex key; an optional key (Ollama) only when the server
+    // has no key of that provider, otherwise the client must send its own.
     // A trusted URL is the server's own (the admin Test of an entry without
-    // one), not a user's
+    // one), not a user's. An unknown provider name has no kind and is
+    // refused here like any other, and named below.
+    const requested = overrides?.provider
+        ? providerDef(overrides.provider)
+        : undefined
     if (
         overrides?.baseUrl &&
         !overrides?.trustedBaseUrl &&
         !overrides?.apiKey &&
-        !(overrides?.provider === "vertexai" && overrides?.vertexApiKey) &&
-        overrides?.provider !== "edgeone" &&
-        !(overrides?.provider === "ollama" && !process.env.OLLAMA_API_KEY)
+        !(requested?.credential === "vertexKey" && overrides?.vertexApiKey) &&
+        requested?.credential !== "none" &&
+        !(
+            requested?.credential === "optionalKey" &&
+            !process.env[
+                envVarsOf(overrides.provider as ProviderName).apiKey as string
+            ]
+        )
     ) {
         throw new Error(
             `API key is required when using a custom base URL. ` +
@@ -824,12 +1123,12 @@ export function getAIModel(clientOverrides?: ClientOverrides): ModelConfig {
     const isClientOverride = !!(
         overrides?.provider &&
         (overrides?.apiKey ||
-            (overrides?.provider === "vertexai" && overrides?.vertexApiKey))
+            (requested?.credential === "vertexKey" && overrides?.vertexApiKey))
     )
 
     // Use client override if provided, otherwise fall back to env vars.
     // AI_MODEL may be comma-separated (multi-model fallback); pick the first.
-    const envModel = process.env.AI_MODEL?.split(",")[0]?.trim() || undefined
+    const envModel = process.env.AI_MODEL?.split(",")[0].trim() || undefined
     const modelId = overrides?.modelId || envModel
 
     if (!modelId) {
@@ -847,13 +1146,18 @@ export function getAIModel(clientOverrides?: ClientOverrides): ModelConfig {
     let provider: ProviderName
     if (overrides?.provider) {
         // Validate client-provided provider
-        if (!Object.hasOwn(PROVIDER_INFO, overrides.provider)) {
+        if (!Object.hasOwn(PROVIDERS, overrides.provider)) {
             throw new Error(
-                `Invalid provider: ${overrides.provider}. Allowed providers: ${Object.keys(PROVIDER_INFO).join(", ")}`,
+                `Invalid provider: ${overrides.provider}. Allowed providers: ${Object.keys(PROVIDERS).join(", ")}`,
             )
         }
         provider = overrides.provider as ProviderName
     } else if (process.env.AI_PROVIDER) {
+        if (!Object.hasOwn(PROVIDERS, process.env.AI_PROVIDER)) {
+            throw new Error(
+                `Unknown AI provider: ${process.env.AI_PROVIDER}. Supported providers: ${Object.keys(PROVIDERS).join(", ")}`,
+            )
+        }
         provider = process.env.AI_PROVIDER as ProviderName
     } else {
         const detected = detectProvider()
@@ -862,12 +1166,12 @@ export function getAIModel(clientOverrides?: ClientOverrides): ModelConfig {
             console.log(`[AI Provider] Auto-detected provider: ${provider}`)
         } else {
             // List configured providers for better error message
-            const configured = Object.entries(PROVIDER_ENV_VARS)
+            const configured = Object.entries(REQUIRED_KEY_VARS)
                 .filter(([, envVar]) => envVar && process.env[envVar as string])
                 .map(([p]) => p)
 
             if (configured.length === 0) {
-                const keys = Object.entries(PROVIDER_ENV_VARS)
+                const keys = Object.entries(REQUIRED_KEY_VARS)
                     .filter(([, envVar]) => envVar)
                     .map(([p, envVar]) => `- ${envVar} for ${p}`)
                 throw new Error(
@@ -883,11 +1187,6 @@ export function getAIModel(clientOverrides?: ClientOverrides): ModelConfig {
             )
         }
     }
-    if (!Object.hasOwn(PROVIDER_INFO, provider)) {
-        throw new Error(
-            `Unknown AI provider: ${provider}. Supported providers: ${Object.keys(PROVIDER_INFO).join(", ")}`,
-        )
-    }
 
     // Only validate server credentials if client isn't providing their own API key
     if (!isClientOverride) {
@@ -900,211 +1199,51 @@ export function getAIModel(clientOverrides?: ClientOverrides): ModelConfig {
 
     console.log(`[AI Provider] Initializing ${provider} with model: ${modelId}`)
 
-    // Requests to a base URL the client chose must not follow redirects
-    const guardedFetch =
-        overrides?.baseUrl && !overrides.trustedBaseUrl
-            ? redirectGuardedFetch()
-            : undefined
     // Build provider-specific options from environment variables
     let providerOptions = buildProviderOptions(provider, modelId)
     let model: LanguageModel
+    const def = PROVIDERS[provider]
 
-    switch (provider) {
-        case "bedrock": {
-            // Use client-provided credentials if available, otherwise fall back to IAM/env vars
-            const hasClientCredentials =
-                overrides?.awsAccessKeyId && overrides?.awsSecretAccessKey
-            // Keys from the admin panel. The ADMIN_ names keep them out of the
-            // default AWS credential chain, which other clients such as the
-            // DynamoDB quota manager use with their own credentials.
-            const adminAccessKeyId = process.env.ADMIN_AWS_ACCESS_KEY_ID
-            const adminSecretAccessKey = process.env.ADMIN_AWS_SECRET_ACCESS_KEY
-            // The region becomes part of the endpoint's host name, so a
-            // request's region must be a region name, or it could send the
-            // server's credentials to another host
-            if (
-                overrides?.awsRegion &&
-                !/^[a-z]{2,4}(-[a-z]+)+-\d{1,2}$/.test(overrides.awsRegion)
-            ) {
-                throw Object.assign(
-                    new Error(`Invalid AWS region "${overrides.awsRegion}"`),
-                    { statusCode: 400 },
-                )
+    if (def.sdk === "bedrock") {
+        model = bedrockModel(modelId, overrides)
+        // Add Anthropic beta options if using Claude models via Bedrock
+        if (modelId.includes("anthropic.claude")) {
+            // Deep merge to preserve both anthropicBeta and reasoningConfig
+            providerOptions = {
+                bedrock: {
+                    ...BEDROCK_ANTHROPIC_BETA.bedrock,
+                    ...(providerOptions?.bedrock || {}),
+                },
             }
-            const bedrockRegion =
-                overrides?.awsRegion ||
-                process.env.ADMIN_AWS_REGION ||
-                process.env.AWS_REGION ||
-                "us-west-2"
-
-            const bedrockProvider = hasClientCredentials
-                ? createAmazonBedrock({
-                      region: bedrockRegion,
-                      accessKeyId: overrides.awsAccessKeyId as string,
-                      secretAccessKey: overrides.awsSecretAccessKey as string,
-                      ...(overrides?.awsSessionToken && {
-                          sessionToken: overrides.awsSessionToken,
-                      }),
-                      // Without an apiKey the SDK reads the server's
-                      // AWS_BEARER_TOKEN_BEDROCK, which wins over the keys
-                      apiKey: "",
-                      // Without a baseURL it reads the server's
-                      // AWS_ENDPOINT_URL_BEDROCK_RUNTIME / AWS_ENDPOINT_URL
-                      baseURL: bedrockRuntimeUrl(bedrockRegion),
-                  })
-                : adminAccessKeyId && adminSecretAccessKey
-                  ? createAmazonBedrock({
-                        region: bedrockRegion,
-                        accessKeyId: adminAccessKeyId,
-                        secretAccessKey: adminSecretAccessKey,
-                        // The keys the admin panel's Test button checked
-                        apiKey: "",
-                    })
-                  : createAmazonBedrock({
-                        region: bedrockRegion,
-                        credentialProvider: fromNodeProviderChain(),
-                    })
-            model = bedrockProvider(modelId)
-            // Add Anthropic beta options if using Claude models via Bedrock
-            if (modelId.includes("anthropic.claude")) {
-                // Deep merge to preserve both anthropicBeta and reasoningConfig
-                providerOptions = {
-                    bedrock: {
-                        ...BEDROCK_ANTHROPIC_BETA.bedrock,
-                        ...(providerOptions?.bedrock || {}),
-                    },
-                }
-            }
-            break
         }
-
-        case "vertexai": {
-            // Express Mode: Use API key for authentication
-            // SECURITY: a client base URL only ever gets the client's key, so the
-            // server's GOOGLE_VERTEX_API_KEY is never sent to a client-chosen host
-            const vertexApiKey = overrides?.baseUrl
-                ? overrides.vertexApiKey
-                : overrides?.vertexApiKey || process.env.GOOGLE_VERTEX_API_KEY
-
-            if (!vertexApiKey) {
-                throw new Error(
-                    "Vertex AI requires an API key for Express Mode. " +
-                        "Get one from Google Cloud Console or set GOOGLE_VERTEX_API_KEY environment variable.",
-                )
-            }
-
-            // Support custom base URL from env or client override.
-            // A client key only goes to the client's URL or the official one.
-            const baseURL = resolveBaseURL(
-                overrides?.vertexApiKey,
-                overrides?.baseUrl,
-                process.env.GOOGLE_VERTEX_BASE_URL,
+    } else {
+        const e = resolveEndpoint(provider, overrides)
+        if (e.selectedKeyEnv) {
+            console.log(`[API Key Routing] Selected ${e.selectedKeyEnv}`)
+        }
+        if (def.credential === "vertexKey" && !e.apiKey) {
+            throw new Error(
+                "Vertex AI requires an API key for Express Mode. " +
+                    "Get one from Google Cloud Console or set GOOGLE_VERTEX_API_KEY environment variable.",
             )
-            model = createVertex({
-                apiKey: vertexApiKey,
-                ...(baseURL && { baseURL }),
-                ...(guardedFetch && { fetch: guardedFetch }),
-            })(modelId)
-            break
         }
-
-        case "ollama": {
-            // SECURITY: When client provides a custom base URL, only use
-            // client-provided API key. Never fall back to server OLLAMA_API_KEY
-            // to prevent leaking server credentials to user-controlled endpoints.
-            const apiKey = overrides?.baseUrl
-                ? overrides?.apiKey || undefined
-                : resolveApiKey(overrides, "OLLAMA_API_KEY")
-            // Like other providers, a user's key never goes to the server's
-            // base URL: without a URL of their own it goes to Ollama Cloud.
-            // The server's key goes to OLLAMA_BASE_URL (or a server model's
-            // own variable), else to the SDK's local default: the desktop
-            // app's "Ollama (Local)" preset puts its key field there too.
-            const baseURL =
-                overrides?.baseUrl ||
-                (overrides?.apiKey
-                    ? PROVIDER_INFO.ollama.defaultBaseUrl
-                    : resolveBaseUrlEnv(overrides, "OLLAMA_BASE_URL"))
-            model = createOllama({
-                ...(baseURL && { baseURL: ollamaApiUrl(baseURL) }),
-                ...(apiKey && {
-                    headers: { Authorization: `Bearer ${apiKey}` },
-                }),
-                ...(guardedFetch && { fetch: guardedFetch }),
-            })(modelId)
-            break
-        }
-
-        case "edgeone":
-            // EdgeOne Pages Edge AI, an OpenAI-compatible API without a key.
-            // The SDK appends /chat/completions to the base URL. Cookies
-            // (eo_token, eo_time) and the access code authenticate the call.
-            model = compatibleModel(provider, modelId, {
-                apiKey: "edgeone",
-                baseURL: overrides?.baseUrl || "/api/edgeai",
-                headers: overrides?.headers,
-                fetch: guardedFetch,
-            })
-            break
-
-        default: {
-            // Every other provider takes an API key and a base URL from
-            // <NAME>_API_KEY / <NAME>_BASE_URL (or a server model's apiKeyEnv)
-            const apiKey = resolveApiKey(
-                overrides,
-                PROVIDER_ENV_VARS[provider] as string,
+        // A key-only provider needs a URL unless its SDK knows the endpoint;
+        // with a user's key an SDK that builds the URL from the server's
+        // resource name (Azure) would read AZURE_RESOURCE_NAME, so it needs one too
+        if (
+            def.credential === "apiKey" &&
+            !e.baseURL &&
+            (!def.sdkKnowsEndpoint ||
+                (def.resourceNameEnv && overrides?.apiKey))
+        ) {
+            throw new Error(
+                `${def.label} needs a base URL. Add it in the model settings.`,
             )
-            const baseUrlEnv =
-                provider === "gateway"
-                    ? "AI_GATEWAY_BASE_URL"
-                    : `${provider.toUpperCase()}_BASE_URL`
-            // A local default (SGLang's 127.0.0.1) only fills the settings
-            // form; the server must not call its own machine for it. With a
-            // user's key the OpenAI SDK would read the server's
-            // OPENAI_BASE_URL, so name the official endpoint.
-            const defaultUrl = PROVIDER_INFO[provider].defaultBaseUrl
-            const publicDefault = defaultUrl?.startsWith("https://")
-                ? defaultUrl
-                : undefined
-            const configuredBaseURL = resolveBaseURL(
-                overrides?.apiKey,
-                overrides?.baseUrl,
-                resolveBaseUrlEnv(overrides, baseUrlEnv),
-            )
-            const baseURL =
-                configuredBaseURL ||
-                (SDK_KNOWS_ENDPOINT.has(provider) &&
-                !(provider === "openai" && overrides?.apiKey)
-                    ? undefined
-                    : publicDefault)
-            // With a user's Azure key the SDK would read the server's
-            // AZURE_RESOURCE_NAME
-            if (
-                !baseURL &&
-                (!SDK_KNOWS_ENDPOINT.has(provider) ||
-                    (provider === "azure" && overrides?.apiKey))
-            ) {
-                throw new Error(
-                    `${PROVIDER_INFO[provider].label} needs a base URL. Add it in the model settings.`,
-                )
-            }
-            model = createModel(provider, modelId, {
-                apiKey,
-                baseURL,
-                configuredBaseURL: !!configuredBaseURL,
-                fetch: guardedFetch,
-                // Bearer auth for Anthropic when there is no API key
-                authToken:
-                    provider === "anthropic" && !apiKey
-                        ? process.env.ANTHROPIC_AUTH_TOKEN
-                        : undefined,
-                // Only the server's own resource; a client key needs its URL
-                resourceName:
-                    provider === "azure" && !overrides?.apiKey
-                        ? process.env.AZURE_RESOURCE_NAME
-                        : undefined,
-            })
         }
+        model = createModel(provider, modelId, {
+            ...e,
+            fetch: e.guarded ? redirectGuardedFetch() : undefined,
+        })
     }
 
     return { model, providerOptions, modelId, provider }
@@ -1113,11 +1252,34 @@ export function getAIModel(clientOverrides?: ClientOverrides): ModelConfig {
 /**
  * The deployment's EdgeOne Pages function, as an absolute URL (the SDK
  * needs one). EdgeOne serves functions by their folder from the site root,
- * so Next's base path does not apply.
+ * so Next's base path does not apply. Behind a proxy req.url is the internal
+ * address and the browser's Origin header is the site's, so Origin wins,
+ * but only for the host the request was addressed to: another site's page
+ * sends its own Origin, and the request's cookies must not go there.
  */
 export function edgeOneEndpoint(req: Request): string {
-    const origin = req.headers.get("origin") || new URL(req.url).origin
-    return `${origin}/api/edgeai`
+    const own = new URL(req.url)
+    const origin = req.headers.get("origin")
+    const originHost = origin ? hostOf(origin) : undefined
+    const addressed = [
+        req.headers.get("x-forwarded-host"),
+        req.headers.get("host"),
+    ].filter((h): h is string => !!h)
+    // Without Host headers (tests, odd runtimes) Origin is all there is
+    const trusted =
+        !!originHost &&
+        (addressed.length === 0 ||
+            addressed.includes(originHost) ||
+            originHost === own.host)
+    return `${trusted ? origin : own.origin}/api/edgeai`
+}
+
+function hostOf(url: string): string | undefined {
+    try {
+        return new URL(url).host
+    } catch {
+        return undefined
+    }
 }
 
 /**
@@ -1145,10 +1307,7 @@ export function globalBaseUrl(provider: ProviderName): string | undefined {
     ) {
         return `https://${process.env.AZURE_RESOURCE_NAME}.openai.azure.com/openai`
     }
-    const name =
-        provider === "gateway"
-            ? "AI_GATEWAY_BASE_URL"
-            : `${provider.toUpperCase()}_BASE_URL`
+    const name = envVarsOf(provider).baseUrl as string
     return process.env[name] || undefined
 }
 
@@ -1159,21 +1318,25 @@ export function getServerProvider(): ProviderName | null {
 
 /**
  * Whether a call made with the caller's own settings runs on an endpoint of
- * the deployment: its EdgeOne function, the server's keyless Ollama, or an
+ * the deployment: the site's own function (EdgeOne, credential "none"), the
+ * server's keyless local provider (Ollama, credential "optionalKey"), or an
  * address on the server's network (which ignores a dummy key header).
- * Bedrock and EdgeOne never use a client base URL. Never in the desktop
- * app, where every endpoint is the user's. clientBaseUrl: normalized.
+ * Bedrock never uses a client base URL. Never in the desktop app, where
+ * every endpoint is the user's. clientBaseUrl: normalized.
  */
 export async function usesServerEndpoint(
-    provider: ProviderName | null | undefined,
+    provider: ProviderName,
     clientBaseUrl: string,
     apiKey: string | null | undefined,
 ): Promise<boolean> {
     if (process.env.NEXT_AI_DRAWIO_DESKTOP === "1") return false
-    if (provider === "edgeone") return true
-    if (provider === "ollama" && !clientBaseUrl && !apiKey) return true
+    const def = PROVIDERS[provider]
+    if (def.credential === "none") return true
+    if (def.credential === "optionalKey" && !clientBaseUrl && !apiKey) {
+        return true
+    }
     return (
-        provider !== "bedrock" &&
+        def.sdk !== "bedrock" &&
         !!clientBaseUrl &&
         (await isPrivateUrl(clientBaseUrl))
     )
@@ -1181,36 +1344,21 @@ export async function usesServerEndpoint(
 
 /**
  * Whether the call is paid for by the server's own credentials (env keys or
- * IAM role) rather than credentials sent with the request. Mirrors which key
- * each branch of getAIModel ends up using.
+ * IAM role) rather than credentials sent with the request: the key
+ * resolveEndpoint picks for getAIModel is the server's.
  */
 export function usesServerCredentials(
     provider: ProviderName,
     overrides?: ClientOverrides,
 ): boolean {
-    // The desktop app's local server holds the user's own preset keys
+    // The desktop app's local server only has the user's own keys (its .env)
     if (process.env.NEXT_AI_DRAWIO_DESKTOP === "1") return false
     // Cleaned like getAIModel does: "/" means no base URL
     const baseUrl = normalizeBaseUrl(overrides?.baseUrl ?? "")
-    switch (provider) {
-        case "bedrock":
-            return !(overrides?.awsAccessKeyId && overrides?.awsSecretAccessKey)
-        case "vertexai":
-            return !overrides?.vertexApiKey
-        case "edgeone":
-            // The platform's own endpoint, no key involved
-            return false
-        case "ollama":
-            // Only a server key costs money; a keyless local server or the
-            // client's own server does not
-            return (
-                !baseUrl &&
-                !overrides?.apiKey &&
-                !!(overrides?.apiKeyEnv || process.env.OLLAMA_API_KEY)
-            )
-        default:
-            return !overrides?.apiKey
-    }
+    return (
+        resolveEndpoint(provider, { ...overrides, baseUrl }).keySource ===
+        "server"
+    )
 }
 
 /**
@@ -1228,12 +1376,7 @@ export const CACHE_POINT = {
  * the Anthropic API or OpenRouter (see CACHE_POINT).
  */
 export function supportsPromptCaching(modelId: string): boolean {
-    return (
-        modelId.includes("claude") ||
-        modelId.includes("anthropic") ||
-        modelId.startsWith("us.anthropic") ||
-        modelId.startsWith("eu.anthropic")
-    )
+    return modelId.includes("claude") || modelId.includes("anthropic")
 }
 
 /**
@@ -1247,7 +1390,7 @@ export function supportsPromptCaching(modelId: string): boolean {
  */
 export function getValidationModel(): ReturnType<typeof getAIModel>["model"] {
     // AI_MODEL may be comma-separated (multi-model fallback); pick the first.
-    const envFallback = process.env.AI_MODEL?.split(",")[0]?.trim() || undefined
+    const envFallback = process.env.AI_MODEL?.split(",")[0].trim() || undefined
     const modelId = process.env.VALIDATION_MODEL || envFallback
 
     if (!modelId) {

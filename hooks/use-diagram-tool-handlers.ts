@@ -1,18 +1,25 @@
-import type { MutableRefObject } from "react"
+import type { ChatAddToolOutputFunction } from "ai"
+import type { RefObject } from "react"
 import type { DiagramOperation } from "@/components/chat/types"
 import type {
     ValidationState,
     ValidationStatus,
 } from "@/components/chat/ValidationCard"
+import type { LoadMode } from "@/contexts/diagram-context"
+import type { ChatUIMessage } from "@/lib/chat-message"
+import { type AiCanvasState, diagramFingerprint } from "@/lib/diagram-context"
+import { pageModelXml, pageSelectorFor, placeOnPage } from "@/lib/diagram-pages"
 import type { ValidationResult } from "@/lib/diagram-validator"
 import { formatValidationFeedback } from "@/lib/diagram-validator"
 import { isMxCellXmlComplete } from "@/lib/utils"
+import { foldCells } from "@/packages/mcp-server/src/compact-cells.ts"
 import { editDiagram } from "@/packages/mcp-server/src/edit-diagram.ts"
+import { restoreImageData } from "@/packages/mcp-server/src/embedded-images.ts"
 import { prepareNewDiagram } from "@/packages/mcp-server/src/new-diagram.ts"
+import { hasCells } from "@/packages/mcp-server/src/pages.ts"
 
-const DEBUG = process.env.NODE_ENV === "development"
-
-// display_diagram replaces the document with this one page
+// The page a drawing is wrapped in; on the canvas it replaces the page the
+// model works on, so the canvas page keeps its own id and name
 const NEW_PAGE = { pageId: "page-1", pageName: "Page-1" }
 
 interface ToolCall {
@@ -21,25 +28,8 @@ interface ToolCall {
     input: unknown
 }
 
-type AddToolOutputSuccess = {
-    tool: string
-    toolCallId: string
-    state?: "output-available"
-    output: string
-    errorText?: undefined
-}
-
-type AddToolOutputError = {
-    tool: string
-    toolCallId: string
-    state: "output-error"
-    output?: undefined
-    errorText: string
-}
-
-type AddToolOutputParams = AddToolOutputSuccess | AddToolOutputError
-
-type AddToolOutputFn = (params: AddToolOutputParams) => void
+// useChat's addToolOutput, typed with the chat's tools
+type AddToolOutputFn = ChatAddToolOutputFunction<ChatUIMessage>
 
 const MAX_VALIDATION_RETRIES = 3
 
@@ -50,16 +40,29 @@ type ValidateDiagramFn = (
 ) => Promise<ValidationResult>
 
 interface UseDiagramToolHandlersParams {
-    partialXmlRef: MutableRefObject<string>
-    editDiagramOriginalXmlRef: MutableRefObject<Map<string, string>>
+    partialXmlRef: RefObject<string>
+    // Diagram before a cut off display_diagram whose half drawn preview
+    // stays while append_diagram finishes it; null when none is pending
+    continuationOriginalRef: RefObject<string | null>
+    editDiagramOriginalXmlRef: RefObject<Map<string, string>>
     // Tool calls the streaming preview must leave alone (shared with it)
-    processedToolCallsRef: MutableRefObject<Set<string>>
+    processedToolCallsRef: RefObject<Set<string>>
     // Failed VLM validations in the current user turn (reset on each user message)
-    validationRetryCountRef: MutableRefObject<number>
-    chartXMLRef: MutableRefObject<string>
-    onDisplayChart: (xml: string, skipValidation?: boolean) => string | null
-    onFetchChart: (saveToHistory?: boolean) => Promise<string>
-    onExport: () => void
+    validationRetryCountRef: RefObject<number>
+    chartXMLRef: RefObject<string>
+    // The page the model reads and writes in this turn (the one the user
+    // viewed when it began); null, or absent, means the first page
+    turnPageIdRef?: RefObject<string | null>
+    // The canvas after each change the model made, by tool call: the next
+    // message sends the canvas only when it differs (lib/diagram-context.ts)
+    aiCanvasStatesRef?: RefObject<Map<string, AiCanvasState>>
+    onDisplayChart: (
+        xml: string,
+        skipValidation?: boolean,
+        mode?: LoadMode,
+        meta?: { toolCallId?: string; pageId?: string | null },
+    ) => string | null
+    onFetchChart: () => Promise<string>
     captureValidationPng?: () => Promise<string | null>
     validateDiagram?: ValidateDiagramFn
     enableVlmValidation?: boolean
@@ -84,13 +87,15 @@ interface UseDiagramToolHandlersParams {
  */
 export function useDiagramToolHandlers({
     partialXmlRef,
+    continuationOriginalRef,
     editDiagramOriginalXmlRef,
     processedToolCallsRef,
     validationRetryCountRef,
     chartXMLRef,
+    turnPageIdRef,
+    aiCanvasStatesRef,
     onDisplayChart,
     onFetchChart,
-    onExport,
     captureValidationPng,
     validateDiagram,
     enableVlmValidation = true,
@@ -121,12 +126,6 @@ export function useDiagramToolHandlers({
         { toolCall }: { toolCall: ToolCall },
         addToolOutput: AddToolOutputFn,
     ) => {
-        if (DEBUG) {
-            console.log(
-                `[onToolCall] Tool: ${toolCall.toolName}, CallId: ${toolCall.toolCallId}`,
-            )
-        }
-
         processedToolCallsRef.current.add(toolCall.toolCallId)
         // Only display_diagram, edit_diagram and a completing append_diagram
         // put their result on the canvas. Other tools (get_shape_library,
@@ -146,6 +145,53 @@ export function useDiagramToolHandlers({
     // handler. The first is the diagram before all of them. A call that
     // draws its result replaces those previews, so the preview code must
     // neither draw them again nor undo them later. Returns that first one.
+    // The final result as one undo step. A cut off drawing it replaces goes
+    // first, so the step (and the version) starts from the diagram before
+    // it, also when a failed call in between was undone to the cut off one.
+    // exact: the canvas holds what the model wrote, with no auto-fix and no
+    // continuation joined to it; otherwise the next message sends the canvas.
+    // base: an edit's starting canvas, to tell a hand change made meanwhile
+    const commit = (
+        xml: string,
+        toolCallId: string,
+        exact: boolean,
+        base: string | null = null,
+    ) => {
+        const original = continuationOriginalRef.current
+        if (original !== null) onDisplayChart(original, true, "revert")
+        onDisplayChart(xml, true, "commit", {
+            toolCallId,
+            pageId: aiPageId(),
+        })
+        continuationOriginalRef.current = null
+        aiCanvasStatesRef?.current.set(toolCallId, {
+            pageId: aiPageId(),
+            fingerprint: pageFingerprint(xml),
+            exact,
+            base: base === null ? null : pageFingerprint(base),
+        })
+    }
+
+    const pageFingerprint = (xml: string) =>
+        diagramFingerprint(pageModelXml(xml, aiPageId()) ?? xml)
+
+    const aiPageId = () => turnPageIdRef?.current ?? null
+
+    // The diagram as the model sees it in the chat request: its page only
+    const shownToModel = (xml: string) =>
+        foldCells(pageModelXml(xml, aiPageId()) ?? xml)
+
+    // The model's XML with the pictures it was shown as references
+    // (embedded-images.ts) put back
+    const withImages = (xml: string) =>
+        restoreImageData(xml, chartXMLRef.current)
+
+    // A drawn page goes onto the model's page of the canvas file, which
+    // keeps its other pages; a drawing that brings several pages replaces
+    // the file. Either way it keeps the file's variables unless it sets its own.
+    const onAiPage = (drawnXml: string) =>
+        placeOnPage(drawnXml, chartXMLRef.current, aiPageId())
+
     const takeOriginals = (): string | undefined => {
         const [originalXml] = editDiagramOriginalXmlRef.current.values()
         for (const id of editDiagramOriginalXmlRef.current.keys()) {
@@ -163,24 +209,21 @@ export function useDiagramToolHandlers({
     ) => {
         const { xml } = toolCall.input as { xml: string }
 
-        // DEBUG: Log raw input to diagnose false truncation detection
-        if (DEBUG) {
-            console.log(
-                "[display_diagram] XML ending (last 100 chars):",
-                xml.slice(-100),
-            )
-            console.log("[display_diagram] XML length:", xml.length)
-        }
-
         // Check if XML is truncated (incomplete mxCell indicates truncated output)
         const isTruncated = !isMxCellXmlComplete(xml)
-        if (DEBUG) {
-            console.log("[display_diagram] isTruncated:", isTruncated)
-        }
 
         if (isTruncated) {
             // Store the partial XML for continuation via append_diagram
             partialXmlRef.current = xml
+            // The half drawn preview stays while append_diagram finishes
+            // it; the chat engine brings this diagram back if that never
+            // happens
+            if (
+                originalXml !== undefined &&
+                continuationOriginalRef.current === null
+            ) {
+                continuationOriginalRef.current = originalXml
+            }
 
             // Tell LLM to use append_diagram to continue
             const partialEnding = partialXmlRef.current.slice(-500)
@@ -210,22 +253,25 @@ NEXT STEP: Call append_diagram with the continuation XML.
 
         // Wrap, validate and auto-fix the model's XML like the MCP server's
         // create_new_diagram, then load it
-        const prepared = prepareNewDiagram(finalXml, NEW_PAGE)
-        const validationError = prepared.ok
-            ? onDisplayChart(prepared.xml, true)
-            : prepared.error
+        // One undo step (and a version) right away, before the screenshot
+        // check: a stop, another chat or a hand edit during the check then
+        // finds the diagram already in place
+        const prepared = prepareNewDiagram(withImages(finalXml), NEW_PAGE)
+        if (prepared.ok) {
+            commit(
+                onAiPage(prepared.xml),
+                toolCall.toolCallId,
+                prepared.fixes.length === 0,
+            )
+        }
+        const validationError = prepared.ok ? null : prepared.error
 
         if (validationError) {
             console.warn("[display_diagram] Validation error:", validationError)
             // Undo the streamed preview, as a failed edit does: the canvas
             // keeps the diagram from before this failed call
-            if (originalXml) onDisplayChart(originalXml, true)
+            if (originalXml) onDisplayChart(originalXml, true, "revert")
             // Return error to model - sendAutomaticallyWhen will trigger retry
-            if (DEBUG) {
-                console.log(
-                    "[display_diagram] Adding tool output with state: output-error",
-                )
-            }
             addToolOutput({
                 tool: "display_diagram",
                 toolCallId: toolCall.toolCallId,
@@ -241,12 +287,6 @@ ${finalXml}
             })
         } else {
             // Success - diagram will be rendered by chat-message-display
-            if (DEBUG) {
-                console.log(
-                    "[display_diagram] Success! Checking if VLM validation is enabled...",
-                )
-            }
-
             // VLM validation after successful display
             if (
                 enableVlmValidation &&
@@ -271,12 +311,6 @@ ${finalXml}
                     if (stopped?.()) {
                         updateValidationState(toolCall.toolCallId, "skipped")
                     } else if (capturedPngData) {
-                        if (DEBUG) {
-                            console.log(
-                                "[display_diagram] Captured PNG for validation",
-                            )
-                        }
-
                         // Each retry is a new tool call, so count attempts
                         // per user turn (the chat resets it when the user sends)
                         const attempt = validationRetryCountRef.current + 1
@@ -302,12 +336,6 @@ ${finalXml}
                             if (attempt < MAX_VALIDATION_RETRIES) {
                                 const feedback =
                                     formatValidationFeedback(result)
-                                if (DEBUG) {
-                                    console.log(
-                                        `[display_diagram] Validation failed (attempt ${attempt}/${MAX_VALIDATION_RETRIES}):`,
-                                        result.issues,
-                                    )
-                                }
 
                                 // Notify UI of validation failure (include the image)
                                 updateValidationState(
@@ -325,16 +353,13 @@ ${finalXml}
                                     tool: "display_diagram",
                                     toolCallId: toolCall.toolCallId,
                                     state: "output-error",
-                                    errorText: `[Validation attempt ${attempt}/${MAX_VALIDATION_RETRIES}]\n${feedback}`,
+                                    // The drawing stays on the canvas, as
+                                    // the app may have fixed it
+                                    errorText: `[Validation attempt ${attempt}/${MAX_VALIDATION_RETRIES}]\n${feedback}\n\nCurrent diagram XML:\n\`\`\`xml\n${shownToModel(chartXMLRef.current)}\n\`\`\``,
                                 })
                                 return
                             } else {
                                 // Last attempt - accept the diagram with warning
-                                if (DEBUG) {
-                                    console.log(
-                                        "[display_diagram] Max validation retries reached, accepting diagram",
-                                    )
-                                }
                                 // Notify UI that we're accepting with issues (include the image)
                                 updateValidationState(
                                     toolCall.toolCallId,
@@ -350,12 +375,6 @@ ${finalXml}
                                 return
                             }
                         } else {
-                            if (DEBUG) {
-                                console.log(
-                                    "[display_diagram] Validation passed!",
-                                )
-                            }
-
                             // Notify UI of success (include the image)
                             // Use "success_with_warnings" if valid but has issues
                             const hasWarnings = result.issues.length > 0
@@ -397,21 +416,11 @@ ${finalXml}
                 }
             }
 
-            if (DEBUG) {
-                console.log(
-                    "[display_diagram] Adding tool output with state: output-available",
-                )
-            }
             addToolOutput({
                 tool: "display_diagram",
                 toolCallId: toolCall.toolCallId,
                 output: "Successfully displayed the diagram.",
             })
-            if (DEBUG) {
-                console.log(
-                    "[display_diagram] Tool output added. Diagram should be visible now.",
-                )
-            }
         }
     }
 
@@ -430,7 +439,7 @@ ${finalXml}
         // On failure, undo the streaming preview so the canvas matches the XML
         // reported back to the model
         const restoreOriginal = () => {
-            if (originalXml) onDisplayChart(originalXml, true)
+            if (originalXml) onDisplayChart(originalXml, true, "revert")
         }
         try {
             if (originalXml) {
@@ -442,13 +451,17 @@ ${finalXml}
                     currentXml = cachedXML
                 } else {
                     // Last resort: export from iframe
-                    currentXml = await onFetchChart(false)
+                    currentXml = await onFetchChart()
                 }
             }
 
             // All or nothing, checked like the MCP server's edit_diagram.
-            // The model sees the first page, so edits target it.
-            const outcome = editDiagram(currentXml, operations, {})
+            // The model sees its page, so edits target it.
+            const outcome = editDiagram(
+                currentXml,
+                operations,
+                pageSelectorFor(currentXml, aiPageId()),
+            )
             if (!outcome.ok) {
                 const reason = outcome.pageError
                     ? outcome.errors[0]
@@ -462,7 +475,7 @@ ${finalXml}
 
 Current diagram XML:
 \`\`\`xml
-${currentXml}
+${shownToModel(currentXml)}
 \`\`\`
 
 Please check the cell IDs and retry.`,
@@ -470,8 +483,12 @@ Please check the cell IDs and retry.`,
                 return
             }
 
-            onDisplayChart(outcome.xml, true)
-            onExport()
+            commit(
+                outcome.xml,
+                toolCall.toolCallId,
+                outcome.fixes.length === 0,
+                currentXml,
+            )
             addToolOutput({
                 tool: "edit_diagram",
                 toolCallId: toolCall.toolCallId,
@@ -492,7 +509,7 @@ Please check the cell IDs and retry.`,
 
 Current diagram XML:
 \`\`\`xml
-${currentXml || "No XML available"}
+${currentXml ? shownToModel(currentXml) : "No XML available"}
 \`\`\`
 
 Please check cell IDs and retry, or use display_diagram to regenerate.`,
@@ -522,7 +539,10 @@ Use display_diagram to create the complete diagram, or edit_diagram to change th
         // Detect if LLM incorrectly started fresh instead of continuing
         // LLM should only output bare mxCells now, so wrapper tags indicate error
         const trimmed = xml.trim()
+        // Definitions at the start are a restart only once cells were written
         const isFreshStart =
+            (trimmed.startsWith("<mxStyle") &&
+                hasCells(partialXmlRef.current)) ||
             trimmed.startsWith("<mxGraphModel") ||
             trimmed.startsWith("<root") ||
             trimmed.startsWith("<mxfile") ||
@@ -557,18 +577,23 @@ Start your continuation with the NEXT character after where it stopped.`,
             const finalXml = partialXmlRef.current
             partialXmlRef.current = "" // Reset
 
-            const prepared = prepareNewDiagram(finalXml, NEW_PAGE)
-            // It draws now: it takes the stored originals, as display_diagram
-            const originalXml = prepared.ok ? takeOriginals() : undefined
-            const validationError = prepared.ok
-                ? onDisplayChart(prepared.xml, true)
-                : prepared.error
+            const prepared = prepareNewDiagram(withImages(finalXml), NEW_PAGE)
+            // The continuation ends here, drawn or not: it takes the stored
+            // originals, so the preview code undoes none of them later
+            const originalXml = takeOriginals()
+            // A continued drawing is pieced together from several calls:
+            // the next message sends the canvas
+            if (prepared.ok) {
+                commit(onAiPage(prepared.xml), toolCall.toolCallId, false)
+            }
+            const validationError = prepared.ok ? null : prepared.error
 
             if (validationError) {
-                // Loading failed: back to the diagram before the previews
-                if (prepared.ok && originalXml) {
-                    onDisplayChart(originalXml, true)
-                }
+                // Back to the diagram before the cut off drawing, or else
+                // before the previews
+                const before = continuationOriginalRef.current ?? originalXml
+                continuationOriginalRef.current = null
+                if (before) onDisplayChart(before, true, "revert")
                 addToolOutput({
                     tool: "append_diagram",
                     toolCallId: toolCall.toolCallId,

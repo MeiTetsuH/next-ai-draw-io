@@ -5,13 +5,7 @@
  */
 
 import { deflateRawSync } from "node:zlib"
-import { beforeAll, describe, expect, it, vi } from "vitest"
-import { installDomPolyfill } from "../src/dom.ts"
-
-beforeAll(() => {
-    installDomPolyfill()
-})
-
+import { describe, expect, it, vi } from "vitest"
 import { applyDiagramOperations } from "../src/diagram-operations.ts"
 
 const DOC = `<mxfile><diagram id="p" name="Page-1"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><UserObject id="a" label="A" link="https://example.com"><mxCell vertex="1" parent="1"><mxGeometry as="geometry"/></mxCell></UserObject><mxCell id="b" value="B" vertex="1" parent="1"><mxGeometry as="geometry"/></mxCell><object id="e1" label="" tooltip="t"><mxCell edge="1" source="b" target="a" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell></object><mxCell id="child" value="C" vertex="1" parent="a"><mxGeometry as="geometry"/></mxCell></root></mxGraphModel></diagram></mxfile>`
@@ -147,5 +141,54 @@ describe("a wrapped mxCell with its wrapper's id", () => {
         expect(errors).toEqual([])
         expect(result.match(/<UserObject/g)).toHaveLength(1)
         expect(result).toContain('label="B"')
+    })
+})
+
+describe("cut-off new_xml", () => {
+    // While edit_diagram streams, the last operation's XML is often
+    // incomplete. Chrome's DOMParser keeps the partial cell, so it must be
+    // refused before it reaches the diagram.
+    const CUT = `<mxCell id="b" value="B2" style="rounded=1;" vertex="1" parent="1">`
+
+    it("refuses an update whose XML is cut off", () => {
+        const { result, errors } = applyDiagramOperations(DOC, [
+            { operation: "update", cell_id: "b", new_xml: CUT },
+        ])
+        expect(errors).toHaveLength(1)
+        expect(errors[0]).toMatchObject({ type: "update", cellId: "b" })
+        expect(errors[0].message).toContain("not well-formed")
+        expect(result).toContain('value="B"')
+        expect(result).not.toContain("B2")
+    })
+
+    it("refuses an add whose XML is cut off", () => {
+        const { result, errors } = applyDiagramOperations(DOC, [
+            {
+                operation: "add",
+                cell_id: "n",
+                new_xml: `<mxCell id="n" value="N" vertex="1" parent="1"><mxGeometry x="1" y="2" width="3"`,
+            },
+        ])
+        expect(errors).toHaveLength(1)
+        expect(errors[0]).toMatchObject({ type: "add", cellId: "n" })
+        expect(result).not.toContain('id="n"')
+    })
+
+    it("applies the complete operations before a cut-off one", () => {
+        const { result, errors } = applyDiagramOperations(DOC, [
+            {
+                operation: "update",
+                cell_id: "b",
+                new_xml: `<mxCell id="b" value="B3" vertex="1" parent="1"><mxGeometry as="geometry"/></mxCell>`,
+            },
+            {
+                operation: "add",
+                cell_id: "n",
+                new_xml: `<mxCell id="n" value="N" vertex="1" parent="1">`,
+            },
+        ])
+        expect(errors).toHaveLength(1)
+        expect(result).toContain('value="B3"')
+        expect(result).not.toContain('id="n"')
     })
 })

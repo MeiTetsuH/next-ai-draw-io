@@ -12,20 +12,23 @@ import {
     getAllSessionMetadata,
     getSession,
     isIndexedDBAvailable,
-    migrateFromLocalStorage,
     readSessionCount,
+    renameSession as renameSessionInDB,
     type SessionMetadata,
     type StoredMessage,
     saveSession,
 } from "@/lib/session-storage"
 import { STORAGE_KEYS } from "@/lib/storage"
+import type { DiagramVersion } from "@/stores/versions-store"
 
 export interface SessionData {
     messages: StoredMessage[]
     xmlSnapshots: [number, string][]
     diagramXml: string
     thumbnailDataUrl?: string
-    diagramHistory?: { svg: string; xml: string }[]
+    versions?: DiagramVersion[]
+    /** Title for a session created by this save (default: first message) */
+    title?: string
 }
 
 // Taken right before a save's data is read: the chat on screen then, and
@@ -57,7 +60,22 @@ export interface UseSessionManagerReturn {
     refreshSessions: () => Promise<void>
     clearCurrentSession: () => void
     getChatGeneration: () => number
+    /** The chat on screen now, also right after a save created it */
+    getCurrentSessionId: () => string | null
     getSaveTicket: () => SaveTicket
+    renameSession: (id: string, title: string) => Promise<void>
+    /**
+     * Run before the URL (browser back or forward) puts another chat on
+     * screen: the chat on screen is saved first, which the app's own ways
+     * of leaving it do themselves
+     */
+    setBeforeUrlSwitch: (handler: (() => Promise<void>) | null) => void
+    /**
+     * Runs fn while the chat with this id is about to be put on screen: a
+     * save meanwhile that creates a session (over the chat limit) does not
+     * delete it as the oldest one
+     */
+    whileOpening: <T>(id: string, fn: () => Promise<T>) => Promise<T>
 }
 
 // Reading the session list loads every stored session in full, and window
@@ -103,6 +121,31 @@ export function useSessionManager(
     const saveSeqRef = useRef(0)
     const savedSeqRef = useRef(0)
 
+    const beforeUrlSwitchRef = useRef<(() => Promise<void>) | null>(null)
+    // The chat about to be put on screen, while the one on screen is saved
+    const openingSessionRef = useRef<{ id: string } | null>(null)
+    const whileOpening = useCallback(
+        async <T>(id: string, fn: () => Promise<T>): Promise<T> => {
+            // Its own: another one opened meanwhile sets another
+            const opening = { id }
+            openingSessionRef.current = opening
+            try {
+                return await fn()
+            } finally {
+                if (openingSessionRef.current === opening) {
+                    openingSessionRef.current = null
+                }
+            }
+        },
+        [],
+    )
+    const setBeforeUrlSwitch = useCallback(
+        (handler: (() => Promise<void>) | null) => {
+            beforeUrlSwitchRef.current = handler
+        },
+        [],
+    )
+
     const changeChat = useCallback((session: ChatSession | null) => {
         chatGenerationRef.current++
         currentSessionRef.current = session
@@ -112,13 +155,7 @@ export function useSessionManager(
 
     // Load sessions list
     const refreshSessions = useCallback(async () => {
-        if (!isIndexedDBAvailable()) return
-        try {
-            const metadata = await getAllSessionMetadata()
-            setSessions(metadata)
-        } catch (error) {
-            console.error("Failed to refresh sessions:", error)
-        }
+        setSessions(await getAllSessionMetadata())
     }, [])
 
     // Initialize on mount
@@ -138,9 +175,6 @@ export function useSessionManager(
             setIsAvailable(true)
 
             try {
-                // Run migration first (one-time conversion from localStorage)
-                await migrateFromLocalStorage()
-
                 // Load sessions list
                 const metadata = await getAllSessionMetadata()
                 setSessions(metadata)
@@ -177,8 +211,6 @@ export function useSessionManager(
                     // If session not found, stay in blank state (URL has invalid session ID)
                 }
                 // If no initialSessionId, start with blank state (no auto-restore)
-            } catch (error) {
-                console.error("Failed to initialize session manager:", error)
             } finally {
                 setIsLoading(false)
             }
@@ -191,7 +223,6 @@ export function useSessionManager(
     // Note: intentionally NOT including currentSessionId in deps to avoid race conditions
     // when clearCurrentSession() is called before URL updates
     useEffect(() => {
-        if (!isInitializedRef.current) return // Wait for initial load
         if (!isAvailable) return
 
         // Increment sequence to invalidate any pending async operations
@@ -215,6 +246,19 @@ export function useSessionManager(
 
                 // Only update if the session is different from current
                 if (session && currentSessionRef.current?.id !== session.id) {
+                    // The chat on screen is saved first. Meanwhile the URL
+                    // may change again, or another chat come on screen.
+                    await whileOpening(session.id, async () => {
+                        try {
+                            await beforeUrlSwitchRef.current?.()
+                        } catch (error) {
+                            console.warn("Failed to save the chat left:", error)
+                        }
+                    })
+                    if (currentSequence !== urlChangeSequenceRef.current) {
+                        return
+                    }
+                    if (generation !== chatGenerationRef.current) return
                     changeChat(session)
                 }
             }
@@ -267,7 +311,7 @@ export function useSessionManager(
                 xmlSnapshots: session.xmlSnapshots,
                 diagramXml: session.diagramXml,
                 thumbnailDataUrl: session.thumbnailDataUrl,
-                diagramHistory: session.diagramHistory,
+                versions: session.versions,
             }
         },
         [currentSessionId, changeChat],
@@ -303,8 +347,6 @@ export function useSessionManager(
                 // A copy read later was saved already (one that waited for
                 // its thumbnail must not undo it)
                 if (seq < savedSeqRef.current) return true
-                // Nothing can be stored without IndexedDB
-                if (!isIndexedDBAvailable()) return true
                 // The user may put another chat on screen while this one is
                 // written; the stored copy is still right, the state is not
                 const stillOnScreen = () =>
@@ -319,8 +361,8 @@ export function useSessionManager(
                         xmlSnapshots: data.xmlSnapshots,
                         diagramXml: data.diagramXml,
                         thumbnailDataUrl: data.thumbnailDataUrl,
-                        diagramHistory: data.diagramHistory,
-                        title: extractTitle(data.messages),
+                        versions: data.versions,
+                        title: data.title || extractTitle(data.messages),
                     }
                     // Without a stored session, keep no session id (it would end
                     // up in the URL and point to nothing after a reload)
@@ -329,7 +371,9 @@ export function useSessionManager(
                         return false
                     }
                     savedSeqRef.current = seq
-                    await enforceSessionLimit()
+                    await enforceSessionLimit(
+                        () => openingSessionRef.current?.id,
+                    )
                     if (stillOnScreen()) {
                         currentSessionRef.current = newSession
                         setCurrentSession(newSession)
@@ -348,8 +392,7 @@ export function useSessionManager(
                     thumbnailDataUrl:
                         data.thumbnailDataUrl ??
                         currentSession.thumbnailDataUrl,
-                    diagramHistory:
-                        data.diagramHistory ?? currentSession.diagramHistory,
+                    versions: data.versions ?? currentSession.versions ?? [],
                     updatedAt: Date.now(),
                     // Update title if it's still default and we have messages
                     title:
@@ -403,6 +446,10 @@ export function useSessionManager(
     }, [changeChat])
 
     const getChatGeneration = useCallback(() => chatGenerationRef.current, [])
+    const getCurrentSessionId = useCallback(
+        () => currentSessionRef.current?.id ?? null,
+        [],
+    )
 
     const getSaveTicket = useCallback(
         (): SaveTicket => ({
@@ -410,6 +457,38 @@ export function useSessionManager(
             seq: ++saveSeqRef.current,
         }),
         [],
+    )
+
+    const renameSession = useCallback(
+        (id: string, title: string): Promise<void> => {
+            const trimmed = title.trim().slice(0, 100)
+            if (!trimmed) return Promise.resolve()
+            // In the save queue, so a save running now cannot put the old
+            // title back
+            const run = async () => {
+                const updated = await renameSessionInDB(id, trimmed)
+                // Also when it could not be stored (another tab deleted the
+                // chat): the next save of the chat on screen writes it
+                const current = currentSessionRef.current
+                if (current?.id === id) {
+                    currentSessionRef.current = { ...current, title: trimmed }
+                    setCurrentSession(currentSessionRef.current)
+                }
+                if (!updated) {
+                    notifySaveFailed(dict.errors.sessionSaveFailed)
+                    return
+                }
+                setSessions((prev) =>
+                    prev.map((s) =>
+                        s.id === id ? { ...s, title: trimmed } : s,
+                    ),
+                )
+            }
+            const result = saveQueueRef.current.then(run)
+            saveQueueRef.current = result.catch(() => {})
+            return result
+        },
+        [dict],
     )
 
     return {
@@ -424,6 +503,10 @@ export function useSessionManager(
         refreshSessions,
         clearCurrentSession,
         getChatGeneration,
+        getCurrentSessionId,
         getSaveTicket,
+        renameSession,
+        setBeforeUrlSwitch,
+        whileOpening,
     }
 }

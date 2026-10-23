@@ -1,6 +1,7 @@
 import { deflateRawSync } from "node:zlib"
 import { act, renderHook } from "@testing-library/react"
 import type React from "react"
+import { toast } from "sonner"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { DiagramProvider, useDiagram } from "@/contexts/diagram-context"
 
@@ -18,17 +19,18 @@ function setup() {
         exportDiagram: (r: any) => requests.push(r),
         load: vi.fn(),
     } as any
-    // draw.io's reply to a request: it echoes the request in `message`
+    // draw.io's reply to a request: it echoes the request in `message`.
+    // Async, so what the caller does with the result runs before it returns
     const reply = (request: { message: string }, data: string, xml = "") =>
-        act(() =>
+        act(async () => {
             result.current.handleDiagramExport({
                 event: "export",
                 data,
                 xml,
                 format: "xmlsvg",
                 message: request,
-            } as any),
-        )
+            } as any)
+        })
     return { result, requests, reply }
 }
 
@@ -53,25 +55,20 @@ afterEach(() => {
 })
 
 describe("exports in flight at the same time", () => {
-    it("give the chat's export only its own reply", () => {
+    it("give the chat's export only its own reply", async () => {
         const { result, requests, reply } = setup()
         // An edit's history export is still on its way when the chat exports
-        act(() => {
-            result.current.handleExport()
+        const older = result.current.fetchDiagramXml()
+        const current = result.current.fetchDiagramXml()
+        let currentDone = false
+        current.then(() => {
+            currentDone = true
         })
-        let tag = ""
-        const got: string[] = []
-        act(() => {
-            tag = result.current.handleExportWithoutHistory()
-            result.current.exportResolversRef.current[tag] = (xml) =>
-                got.push(xml)
-        })
-        reply(requests[0], svgOf("older"))
-        expect(got).toEqual([])
-        reply(requests[1], svgOf("current"))
-        expect(got).toHaveLength(1)
-        expect(got[0]).toContain('value="current"')
-        expect(result.current.exportResolversRef.current[tag]).toBeUndefined()
+        await reply(requests[0], svgOf("older"))
+        expect(await older).toContain('value="older"')
+        expect(currentDone).toBe(false)
+        await reply(requests[1], svgOf("current"))
+        expect(await current).toContain('value="current"')
     })
 
     it("save each file with its own result", async () => {
@@ -101,8 +98,8 @@ describe("exports in flight at the same time", () => {
             result.current.saveDiagramToFile("pic", "png")
         })
         // The PNG answers first
-        reply(requests[1], "data:image/png;base64,iVBORw0KGgo=")
-        reply(requests[0], svgOf("doc"), twoPages)
+        await reply(requests[1], "data:image/png;base64,iVBORw0KGgo=")
+        await reply(requests[0], svgOf("doc"), twoPages)
 
         expect(saved.map((s) => s.name)).toEqual(["pic.png", "doc.drawio"])
         expect(saved[0].href).toMatch(/^data:image\/png/)
@@ -115,5 +112,82 @@ describe("exports in flight at the same time", () => {
         expect(text).toContain('name="A"')
         expect(text).toContain('name="B"')
         vi.unstubAllGlobals()
+    })
+})
+
+describe("exported files", () => {
+    // Every save asked for, and the toast after a download
+    async function save(format: "drawio" | "png" | "svg" | "xmlsvg") {
+        const { result, requests, reply } = setup()
+        vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(
+            () => {},
+        )
+        URL.createObjectURL = vi.fn(() => "blob:test")
+        URL.revokeObjectURL = vi.fn()
+        vi.stubGlobal(
+            "fetch",
+            vi.fn(async () => new Response("{}")),
+        )
+        act(() => {
+            result.current.saveDiagramToFile(
+                "pic",
+                format,
+                undefined,
+                "Exported {name}",
+            )
+        })
+        const request = requests[0]
+        await reply(
+            request,
+            format === "png"
+                ? "data:image/png;base64,iVBORw0KGgo="
+                : svgOf("x"),
+        )
+        vi.unstubAllGlobals()
+        return request
+    }
+
+    afterEach(() => {
+        localStorage.clear()
+        vi.mocked(toast.success).mockClear()
+    })
+
+    it("draw a PNG of the page on screen at twice the size on white, with a margin", async () => {
+        expect(await save("png")).toMatchObject({
+            format: "png",
+            scale: 2,
+            border: 20,
+            currentPage: true,
+            background: "#ffffff",
+        })
+        expect(toast.success).toHaveBeenCalledWith("Exported pic.png", {
+            duration: 4000,
+        })
+    })
+
+    it("leave out the background when the dialog asked for that", async () => {
+        localStorage.setItem("next-ai-draw-io-png-transparent", "true")
+        const request = await save("png")
+        expect(request).toMatchObject({ transparent: true, border: 20 })
+        expect(request).not.toHaveProperty("background")
+    })
+
+    it("export a PNG when storage is blocked", async () => {
+        vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+            throw new DOMException("blocked", "SecurityError")
+        })
+        expect(await save("png")).toMatchObject({
+            format: "png",
+            background: "#ffffff",
+        })
+        expect(toast.success).toHaveBeenCalledWith("Exported pic.png", {
+            duration: 4000,
+        })
+    })
+
+    it("give SVG pictures the margin, and the draw.io file none", async () => {
+        expect(await save("svg")).toMatchObject({ format: "svg", border: 20 })
+        expect(await save("xmlsvg")).toMatchObject({ border: 20 })
+        expect(await save("drawio")).not.toHaveProperty("border")
     })
 })

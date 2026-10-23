@@ -1,25 +1,19 @@
-import { expect, getIframe, openSettings, test } from "./lib/fixtures"
+import { expect, openApp, openSettingsTab, test } from "./lib/fixtures"
 
 test.describe("Settings", () => {
     test.beforeEach(async ({ page }) => {
-        await page.goto("/", { waitUntil: "networkidle" })
-        await getIframe(page).waitFor({ state: "visible", timeout: 30000 })
-    })
-
-    test("settings dialog opens", async ({ page }) => {
-        await openSettings(page)
-        // openSettings already verifies dialog is visible
+        await openApp(page)
     })
 
     test("language selection is available", async ({ page }) => {
-        await openSettings(page)
+        await openSettingsTab(page, "general")
 
         const dialog = page.locator('[role="dialog"]')
-        await expect(dialog.locator('text="English"')).toBeVisible()
+        await expect(dialog.locator("#language-select")).toHaveText(/English/)
     })
 
     test("max output tokens is editable and persists", async ({ page }) => {
-        await openSettings(page)
+        await openSettingsTab(page, "drawing")
 
         const input = page.locator("#max-output-tokens")
         await expect(input).toBeVisible()
@@ -38,11 +32,14 @@ test.describe("Settings", () => {
         await expect(input).toHaveValue("12000")
     })
 
-    test("draw.io theme toggle exists", async ({ page }) => {
-        await openSettings(page)
+    test("theme can be light, dark or follow the system", async ({ page }) => {
+        await openSettingsTab(page, "general")
 
         const dialog = page.locator('[role="dialog"]')
-        const themeText = dialog.locator("text=/sketch|minimal/i")
-        await expect(themeText.first()).toBeVisible()
+        for (const name of ["Light", "Dark", "System"]) {
+            await expect(dialog.getByRole("radio", { name })).toBeVisible()
+        }
+        await dialog.getByRole("radio", { name: "Dark" }).click()
+        await expect(page.locator("html")).toHaveClass(/dark/)
     })
 })

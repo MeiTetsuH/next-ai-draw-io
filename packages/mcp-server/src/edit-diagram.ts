@@ -7,15 +7,25 @@
  * so the model never builds on a half-applied edit.
  */
 
+import { defaultLayerOf, expandCompactCells } from "./compact-cells.ts"
 import {
     applyDiagramOperations,
     type DiagramOperation,
 } from "./diagram-operations.ts"
+import { restoreImageData } from "./embedded-images.ts"
 import { type PageSelector, projectPage } from "./pages.ts"
+import { addDefaultStyles, edgeIdsOf } from "./style-classes.ts"
 import { validateAndFixXml, validateMxCellStructure } from "./xml-validation.ts"
 
 export type EditOutcome =
-    | { ok: true; xml: string; applied: number; fixes: string[] }
+    | {
+          ok: true
+          xml: string
+          applied: number
+          fixes: string[]
+          /** Ids of updates that sent the cell as it already was */
+          unchanged: string[]
+      }
     | { ok: false; errors: string[]; pageError: boolean }
 
 /** Number of top-level elements in an XML fragment. */
@@ -48,9 +58,20 @@ export function editDiagram(
     const fixes: string[] = []
     const prepared: DiagramOperation[] = []
 
+    // Edges already on the page, so a label added to one is not wrapped, and
+    // the layer a compact cell without a parent goes on
+    const page = targetPageXml(xml, selector)
+    const edges = edgeIdsOf(page)
+    const layer = defaultLayerOf(page)
     for (const op of operations) {
         if (op.operation === "delete" || !op.new_xml) {
             prepared.push(op)
+            continue
+        }
+        if (/<mxStyle\b/i.test(op.new_xml)) {
+            errors.push(
+                `${op.operation} ${op.cell_id}: named styles (mxStyle) are not available in edit_diagram; write the cell's complete style`,
+            )
             continue
         }
         // Checked before validation: several cells fail the strict parser
@@ -71,15 +92,27 @@ export function editDiagram(
         if (check.fixed) {
             fixes.push(`${op.cell_id}: ${check.fixes.join(", ")}`)
         }
-        prepared.push({ ...op, new_xml: check.fixed ?? op.new_xml })
+        // The defaults the model is told not to write (style-classes.ts),
+        // added after the fixes so a repaired cell gets them too; the
+        // pictures it was shown as references (embedded-images.ts) go back in
+        prepared.push({
+            ...op,
+            new_xml: addDefaultStyles(
+                expandCompactCells(
+                    restoreImageData(check.fixed ?? op.new_xml, xml),
+                    layer,
+                ),
+                edges,
+            ),
+        })
     }
     if (errors.length > 0) return { ok: false, errors, pageError: false }
 
-    const { result, errors: opErrors } = applyDiagramOperations(
-        xml,
-        prepared,
-        selector,
-    )
+    const {
+        result,
+        errors: opErrors,
+        unchanged,
+    } = applyDiagramOperations(xml, prepared, selector)
     // An empty cellId means the page itself could not be edited
     const pageLevel = opErrors.find((e) => e.cellId === "")
     if (pageLevel) {
@@ -105,5 +138,11 @@ export function editDiagram(
         }
     }
 
-    return { ok: true, xml: result, applied: operations.length, fixes }
+    return {
+        ok: true,
+        xml: result,
+        applied: operations.length,
+        fixes,
+        unchanged,
+    }
 }

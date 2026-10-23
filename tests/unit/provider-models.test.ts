@@ -113,12 +113,9 @@ describe("listProviderModels", () => {
 
     it("lists Ollama from where chat goes without a base URL", async () => {
         const { fn, calls } = answer({ models: [{ name: "llama3.2" }] })
-        process.env.OLLAMA_BASE_URL = "http://ollama.internal:11434"
-        try {
-            await listProviderModels("ollama", {}, fn)
-        } finally {
-            delete process.env.OLLAMA_BASE_URL
-        }
+        vi.stubEnv("OLLAMA_BASE_URL", "http://ollama.internal:11434")
+        await listProviderModels("ollama", {}, fn)
+        vi.stubEnv("OLLAMA_BASE_URL", undefined)
         await listProviderModels("ollama", {}, fn)
         expect(calls.map((c) => c.url)).toEqual([
             "http://ollama.internal:11434/api/tags",
@@ -129,12 +126,8 @@ describe("listProviderModels", () => {
     it("lists Ollama Cloud with a user's key, like chat", async () => {
         // The user's key must not go to the server's Ollama
         const { fn, calls } = answer({ models: [{ name: "gpt-oss:120b" }] })
-        process.env.OLLAMA_BASE_URL = "http://ollama.internal:11434"
-        try {
-            await listProviderModels("ollama", { apiKey: "user-key" }, fn)
-        } finally {
-            delete process.env.OLLAMA_BASE_URL
-        }
+        vi.stubEnv("OLLAMA_BASE_URL", "http://ollama.internal:11434")
+        await listProviderModels("ollama", { apiKey: "user-key" }, fn)
         expect(calls[0].url).toBe("https://ollama.com/api/tags")
     })
 
@@ -191,6 +184,19 @@ describe("POST /api/provider-models", () => {
     it("needs the user's key where the list is not public", async () => {
         const res = await post({ provider: "deepseek" })
         expect(res.status).toBe(400)
+    })
+
+    it("refuses a key or URL that is not text", async () => {
+        const fetchMock = vi.fn()
+        vi.stubGlobal("fetch", fetchMock)
+        for (const extra of [
+            { apiKey: {} },
+            { apiKey: "k", baseUrl: ["https://a.example"] },
+        ]) {
+            const res = await post({ provider: "gateway", ...extra })
+            expect(res.status).toBe(400)
+        }
+        expect(fetchMock).not.toHaveBeenCalled()
     })
 
     it("explains a failure with the error hints", async () => {
@@ -272,25 +278,21 @@ describe("POST /api/provider-models", () => {
     })
 
     it("explains a refused redirect", async () => {
-        process.env.ALLOW_PRIVATE_URLS = "false"
-        try {
-            vi.stubGlobal(
-                "fetch",
-                vi.fn(
-                    async () =>
-                        new Response(null, {
-                            status: 301,
-                            headers: { location: "https://elsewhere.example" },
-                        }),
-                ),
-            )
-            const data = await (
-                await post({ provider: "ollama", baseUrl: "https://x.example" })
-            ).json()
-            expect(data.error).toMatch(/Redirects are not allowed/)
-        } finally {
-            delete process.env.ALLOW_PRIVATE_URLS
-        }
+        vi.stubEnv("ALLOW_PRIVATE_URLS", "false")
+        vi.stubGlobal(
+            "fetch",
+            vi.fn(
+                async () =>
+                    new Response(null, {
+                        status: 301,
+                        headers: { location: "https://elsewhere.example" },
+                    }),
+            ),
+        )
+        const data = await (
+            await post({ provider: "ollama", baseUrl: "https://x.example" })
+        ).json()
+        expect(data.error).toMatch(/Redirects are not allowed/)
     })
 
     it("keeps its own explanations and hides other error texts", async () => {

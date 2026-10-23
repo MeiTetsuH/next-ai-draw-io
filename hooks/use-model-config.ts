@@ -2,8 +2,10 @@
 
 import { useCallback, useEffect, useState } from "react"
 import { getApiEndpoint } from "@/lib/base-path"
+import { PROVIDERS } from "@/lib/providers"
 import type { FlattenedServerModel } from "@/lib/server-model-config"
 import { STORAGE_KEYS } from "@/lib/storage"
+import { supportsThinkingToggle } from "@/lib/thinking-capabilities"
 import {
     createEmptyConfig,
     createModelConfig,
@@ -13,59 +15,12 @@ import {
     flattenModels,
     type ModelConfig,
     type MultiModelConfig,
-    PROVIDER_INFO,
     type ProviderConfig,
     type ProviderName,
 } from "@/lib/types/model-config"
 
-// Old storage keys for migration
-const OLD_KEYS = {
-    aiProvider: "next-ai-draw-io-ai-provider",
-    aiBaseUrl: "next-ai-draw-io-ai-base-url",
-    aiApiKey: "next-ai-draw-io-ai-api-key",
-    aiModel: "next-ai-draw-io-ai-model",
-}
-
-/**
- * Migrate from old single-provider format to new multi-model format
- */
-function migrateOldConfig(): MultiModelConfig | null {
-    if (typeof window === "undefined") return null
-
-    const oldProvider = localStorage.getItem(OLD_KEYS.aiProvider)
-    const oldApiKey = localStorage.getItem(OLD_KEYS.aiApiKey)
-    const oldModel = localStorage.getItem(OLD_KEYS.aiModel)
-
-    // No old config to migrate
-    if (!oldProvider || !oldApiKey || !oldModel) return null
-
-    const oldBaseUrl = localStorage.getItem(OLD_KEYS.aiBaseUrl)
-
-    // Create new config from old format
-    const provider = createProviderConfig(oldProvider as ProviderName)
-    provider.apiKey = oldApiKey
-    if (oldBaseUrl) provider.baseUrl = oldBaseUrl
-
-    const model = createModelConfig(oldModel)
-    provider.models.push(model)
-
-    const config: MultiModelConfig = {
-        version: 1,
-        providers: [provider],
-        selectedModelId: model.id,
-    }
-
-    // Clear old keys after migration
-    localStorage.removeItem(OLD_KEYS.aiProvider)
-    localStorage.removeItem(OLD_KEYS.aiBaseUrl)
-    localStorage.removeItem(OLD_KEYS.aiApiKey)
-    localStorage.removeItem(OLD_KEYS.aiModel)
-
-    return config
-}
-
 const isKnownProvider = (p: { provider: string }) =>
-    Object.hasOwn(PROVIDER_INFO, p.provider)
+    Object.hasOwn(PROVIDERS, p.provider)
 
 /**
  * The stored config without providers this version does not know (saved
@@ -90,9 +45,6 @@ function parseStoredConfig(stored: string): MultiModelConfig {
  * Load config from localStorage
  */
 function loadConfig(): MultiModelConfig {
-    if (typeof window === "undefined") return createEmptyConfig()
-
-    // First, check if new format exists
     const stored = localStorage.getItem(STORAGE_KEYS.modelConfigs)
     if (stored) {
         try {
@@ -102,17 +54,6 @@ function loadConfig(): MultiModelConfig {
         }
     }
 
-    // Try migration from old format
-    const migrated = migrateOldConfig()
-    if (migrated) {
-        // Save migrated config
-        localStorage.setItem(
-            STORAGE_KEYS.modelConfigs,
-            JSON.stringify(migrated),
-        )
-        return migrated
-    }
-
     return createEmptyConfig()
 }
 
@@ -120,7 +61,6 @@ function loadConfig(): MultiModelConfig {
  * Save config to localStorage
  */
 function saveConfig(config: MultiModelConfig): void {
-    if (typeof window === "undefined") return
     // Providers this version does not know are not in config: keep them,
     // with their keys, for the version that saved them
     let unknown: MultiModelConfig["providers"] = []
@@ -159,13 +99,10 @@ export interface UseModelConfigReturn {
 
     // Getters
     models: FlattenedModel[]
-    selectedModel: FlattenedModel | undefined
     selectedModelId: string | undefined
-    showUnvalidatedModels: boolean
 
     // Actions
     setSelectedModelId: (modelId: string | undefined) => void
-    setShowUnvalidatedModels: (show: boolean) => void
     addProvider: (provider: ProviderName) => ProviderConfig
     updateProvider: (
         providerId: string,
@@ -179,7 +116,6 @@ export interface UseModelConfigReturn {
         updates: Partial<ModelConfig>,
     ) => void
     deleteModel: (providerId: string, modelConfigId: string) => void
-    resetConfig: () => void
 }
 
 export function useModelConfig(): UseModelConfigReturn {
@@ -208,7 +144,6 @@ export function useModelConfig(): UseModelConfigReturn {
     // Load server models on mount (if any), and again when the desktop app
     // restarted its server for another preset
     useEffect(() => {
-        if (typeof window === "undefined") return
         loadServerModels()
         return window.electronAPI?.onServerRestarted?.(loadServerModels)
     }, [])
@@ -279,7 +214,7 @@ export function useModelConfig(): UseModelConfigReturn {
             id: m.id,
             modelId: m.modelId,
             provider: m.provider,
-            providerLabel: `Server · ${m.providerLabel}`,
+            providerLabel: m.providerLabel,
             apiKey: "",
             baseUrl: undefined,
             awsAccessKeyId: undefined,
@@ -289,29 +224,16 @@ export function useModelConfig(): UseModelConfigReturn {
             validated: true,
             source: "server" as const,
             isDefault: m.isDefault,
-            apiKeyEnv: m.apiKeyEnv,
-            baseUrlEnv: m.baseUrlEnv,
         })),
         // User models from local configuration
         ...userModels,
     ]
-
-    const selectedModel = config.selectedModelId
-        ? models.find((m) => m.id === config.selectedModelId)
-        : undefined
 
     // Actions
     const setSelectedModelId = useCallback((modelId: string | undefined) => {
         setConfig((prev) => ({
             ...prev,
             selectedModelId: modelId,
-        }))
-    }, [])
-
-    const setShowUnvalidatedModels = useCallback((show: boolean) => {
-        setConfig((prev) => ({
-            ...prev,
-            showUnvalidatedModels: show,
         }))
     }, [])
 
@@ -431,26 +353,18 @@ export function useModelConfig(): UseModelConfigReturn {
         [serverModels],
     )
 
-    const resetConfig = useCallback(() => {
-        setConfig(createEmptyConfig())
-    }, [])
-
     return {
         config,
         isLoaded: isLoaded && serverLoaded,
         models,
-        selectedModel,
         selectedModelId: config.selectedModelId,
-        showUnvalidatedModels: config.showUnvalidatedModels ?? false,
         setSelectedModelId,
-        setShowUnvalidatedModels,
         addProvider,
         updateProvider,
         deleteProvider,
         addModel,
         updateModel,
         deleteModel,
-        resetConfig,
     }
 }
 
@@ -473,6 +387,10 @@ export function getSelectedAIConfig(): {
     selectedModelId: string
     // Vertex AI credentials (Express Mode)
     vertexApiKey: string
+    // The user's provider of the selected model ("" for a server model)
+    providerId: string
+    // "true" or "false" for a model with a thinking switch, else ""
+    thinkingEnabled: string
 } {
     const empty = {
         accessCode: "",
@@ -486,32 +404,16 @@ export function getSelectedAIConfig(): {
         awsSessionToken: "",
         selectedModelId: "",
         vertexApiKey: "",
+        providerId: "",
+        thinkingEnabled: "",
     }
-
-    if (typeof window === "undefined") return empty
 
     // Get access code (separate from model config)
     const accessCode = localStorage.getItem(STORAGE_KEYS.accessCode) || ""
 
     // Load multi-model config
     const stored = localStorage.getItem(STORAGE_KEYS.modelConfigs)
-    if (!stored) {
-        // Fallback to old format for backward compatibility
-        return {
-            accessCode,
-            aiProvider: localStorage.getItem(OLD_KEYS.aiProvider) || "",
-            aiBaseUrl: localStorage.getItem(OLD_KEYS.aiBaseUrl) || "",
-            aiApiKey: localStorage.getItem(OLD_KEYS.aiApiKey) || "",
-            aiModel: localStorage.getItem(OLD_KEYS.aiModel) || "",
-            // Old format didn't support AWS
-            awsAccessKeyId: "",
-            awsSecretAccessKey: "",
-            awsRegion: "",
-            awsSessionToken: "",
-            selectedModelId: "",
-            vertexApiKey: "",
-        }
-    }
+    if (!stored) return { ...empty, accessCode }
 
     let config: MultiModelConfig
     try {
@@ -530,7 +432,7 @@ export function getSelectedAIConfig(): {
     // Provider is resolved server-side via findServerModelById()
     if (config.selectedModelId.startsWith("server:")) {
         const parts = config.selectedModelId.split(":")
-        const nameSlug = parts[1] || ""
+        const nameSlug = parts[1]
         const modelId = parts.slice(2).join(":") // Preserve Bedrock-style IDs
 
         return {
@@ -539,8 +441,6 @@ export function getSelectedAIConfig(): {
             // Note: nameSlug is NOT the provider, but we send it for backwards compat
             // Server uses selectedModelId to lookup the actual provider
             aiProvider: nameSlug,
-            aiBaseUrl: "",
-            aiApiKey: "",
             aiModel: modelId,
             selectedModelId: config.selectedModelId,
         }
@@ -563,8 +463,15 @@ export function getSelectedAIConfig(): {
         awsSecretAccessKey: model.awsSecretAccessKey || "",
         awsRegion: model.awsRegion || "",
         awsSessionToken: model.awsSessionToken || "",
-        selectedModelId: config.selectedModelId || "",
+        selectedModelId: config.selectedModelId,
         // Vertex AI credentials (Express Mode)
         vertexApiKey: model.vertexApiKey || "",
+        providerId:
+            config.providers.find((p) =>
+                p.models.some((m) => m.id === config.selectedModelId),
+            )?.id ?? "",
+        thinkingEnabled: supportsThinkingToggle(model.provider, model.modelId)
+            ? String(model.thinkingEnabled ?? true)
+            : "",
     }
 }

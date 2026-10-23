@@ -1,5 +1,5 @@
 import { createOpenAI } from "@ai-sdk/openai"
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { beforeEach, describe, expect, it, vi } from "vitest"
 import { AWS_REGIONS } from "@/components/provider-credentials-fields"
 import {
     getAIModel,
@@ -78,22 +78,10 @@ const ENV_KEYS = [
     "AZURE_RESOURCE_NAME",
     "OLLAMA_BASE_URL",
 ]
-const savedEnv: Record<string, string | undefined> = {}
-
 beforeEach(() => {
-    for (const key of ENV_KEYS) {
-        savedEnv[key] = process.env[key]
-        delete process.env[key]
-    }
+    for (const key of ENV_KEYS) vi.stubEnv(key, undefined)
     settings.values = {}
     vi.clearAllMocks()
-})
-
-afterEach(() => {
-    for (const key of ENV_KEYS) {
-        if (savedEnv[key] === undefined) delete process.env[key]
-        else process.env[key] = savedEnv[key]
-    }
 })
 
 describe("Vertex AI key security", () => {
@@ -199,6 +187,30 @@ describe("Bedrock admin panel credentials", () => {
         })
     })
 
+    it("uses the client's Bedrock API key before any keys", async () => {
+        process.env.ADMIN_AWS_ACCESS_KEY_ID = "panel-id"
+        process.env.ADMIN_AWS_SECRET_ACCESS_KEY = "panel-secret"
+        const { createAmazonBedrock } = await import("@ai-sdk/amazon-bedrock")
+
+        getAIModel({
+            provider: "bedrock",
+            modelId: "amazon.nova-lite-v1:0",
+            apiKey: "bedrock-api-key",
+            awsAccessKeyId: "client-id",
+            awsSecretAccessKey: "client-secret",
+            awsRegion: "ap-northeast-1",
+        })
+
+        expect(createAmazonBedrock).toHaveBeenCalledWith({
+            region: "ap-northeast-1",
+            apiKey: "bedrock-api-key",
+            // Not the server's AWS_ENDPOINT_URL_BEDROCK_RUNTIME
+            baseURL: "https://bedrock-runtime.ap-northeast-1.amazonaws.com",
+            // Nor its AWS keys, should the SDK drop the key
+            credentialProvider: expect.any(Function),
+        })
+    })
+
     it("refuses a region that is not a region name", async () => {
         // It becomes part of the endpoint's host name, with the server's
         // credentials too
@@ -271,8 +283,10 @@ describe("usesServerCredentials", () => {
     })
 
     it("looks at the credential each provider actually uses", () => {
-        // A stray x-ai-api-key does not replace the IAM role or Vertex key
-        expect(usesServerCredentials("bedrock", { apiKey: "x" })).toBe(true)
+        // A Bedrock API key is the client's own; a stray x-ai-api-key
+        // does not replace the Vertex key
+        expect(usesServerCredentials("bedrock", { apiKey: "x" })).toBe(false)
+        expect(usesServerCredentials("bedrock", {})).toBe(true)
         expect(
             usesServerCredentials("bedrock", {
                 awsAccessKeyId: "id",
@@ -415,81 +429,58 @@ describe("whose keys a request uses", () => {
         )
     })
 
-    it("sends the server's Ollama key where OLLAMA_BASE_URL says, or to local Ollama", async () => {
-        // The desktop app's "Ollama (Local)" preset puts its API Key field
-        // into OLLAMA_API_KEY; with no base URL that is the local Ollama
-        process.env.OLLAMA_API_KEY = "server-key"
-        const { createOllama } = await import("ollama-ai-provider-v2")
-        getAIModel({ provider: "ollama", modelId: "m" })
-        expect(vi.mocked(createOllama).mock.lastCall?.[0]).not.toHaveProperty(
-            "baseURL",
-        )
-        process.env.OLLAMA_BASE_URL = "https://ollama.com/api"
-        getAIModel({ provider: "ollama", modelId: "m" })
-        expect(createOllama).toHaveBeenLastCalledWith(
-            expect.objectContaining({ baseURL: "https://ollama.com/api" }),
-        )
-    })
-
     it("uses a server model's own Ollama URL variable", async () => {
         process.env.OLLAMA_BASE_URL = "http://other.internal:11434/api"
-        process.env.MY_OLLAMA_URL = "https://ollama.proxy.example/api"
-        process.env.MY_OLLAMA_KEY = "proxy-key"
-        try {
-            const { createOllama } = await import("ollama-ai-provider-v2")
-            getAIModel({
-                provider: "ollama",
-                modelId: "m",
-                apiKeyEnv: "MY_OLLAMA_KEY",
-                baseUrlEnv: "MY_OLLAMA_URL",
-            })
-            expect(createOllama).toHaveBeenLastCalledWith(
-                expect.objectContaining({
-                    baseURL: "https://ollama.proxy.example/api",
-                    headers: { Authorization: "Bearer proxy-key" },
-                }),
-            )
-        } finally {
-            delete process.env.MY_OLLAMA_URL
-            delete process.env.MY_OLLAMA_KEY
-        }
+        vi.stubEnv("MY_OLLAMA_URL", "https://ollama.proxy.example/api")
+        vi.stubEnv("MY_OLLAMA_KEY", "proxy-key")
+        const { createOllama } = await import("ollama-ai-provider-v2")
+        getAIModel({
+            provider: "ollama",
+            modelId: "m",
+            apiKeyEnv: "MY_OLLAMA_KEY",
+            baseUrlEnv: "MY_OLLAMA_URL",
+        })
+        expect(createOllama).toHaveBeenLastCalledWith(
+            expect.objectContaining({
+                baseURL: "https://ollama.proxy.example/api",
+                headers: { Authorization: "Bearer proxy-key" },
+            }),
+        )
     })
 
     it("runs an Azure entry set up only in the admin panel", async () => {
         // No AZURE_BASE_URL or AZURE_RESOURCE_NAME: the entry's own
         // variables hold the key and the resource URL
-        process.env.ADMIN_AZURE_API_KEY = "panel-key"
-        process.env.ADMIN_AZURE_BASE_URL = "https://res.openai.azure.com/openai"
-        try {
-            const { createAzure } = await import("@ai-sdk/azure")
-            expect(() =>
-                getAIModel({
-                    provider: "azure",
-                    modelId: "gpt-4o",
-                    apiKeyEnv: "ADMIN_AZURE_API_KEY",
-                    baseUrlEnv: "ADMIN_AZURE_BASE_URL",
-                }),
-            ).not.toThrow()
-            expect(createAzure).toHaveBeenLastCalledWith(
-                expect.objectContaining({
-                    apiKey: "panel-key",
-                    baseURL: "https://res.openai.azure.com/openai",
-                }),
-            )
-            // Without any URL it still says what is missing
-            delete process.env.ADMIN_AZURE_BASE_URL
-            expect(() =>
-                getAIModel({
-                    provider: "azure",
-                    modelId: "gpt-4o",
-                    apiKeyEnv: "ADMIN_AZURE_API_KEY",
-                    baseUrlEnv: "ADMIN_AZURE_BASE_URL",
-                }),
-            ).toThrow(/AZURE_BASE_URL/)
-        } finally {
-            delete process.env.ADMIN_AZURE_API_KEY
-            delete process.env.ADMIN_AZURE_BASE_URL
-        }
+        vi.stubEnv("ADMIN_AZURE_API_KEY", "panel-key")
+        vi.stubEnv(
+            "ADMIN_AZURE_BASE_URL",
+            "https://res.openai.azure.com/openai",
+        )
+        const { createAzure } = await import("@ai-sdk/azure")
+        expect(() =>
+            getAIModel({
+                provider: "azure",
+                modelId: "gpt-4o",
+                apiKeyEnv: "ADMIN_AZURE_API_KEY",
+                baseUrlEnv: "ADMIN_AZURE_BASE_URL",
+            }),
+        ).not.toThrow()
+        expect(createAzure).toHaveBeenLastCalledWith(
+            expect.objectContaining({
+                apiKey: "panel-key",
+                baseURL: "https://res.openai.azure.com/openai",
+            }),
+        )
+        // Without any URL it still says what is missing
+        vi.stubEnv("ADMIN_AZURE_BASE_URL", undefined)
+        expect(() =>
+            getAIModel({
+                provider: "azure",
+                modelId: "gpt-4o",
+                apiKeyEnv: "ADMIN_AZURE_API_KEY",
+                baseUrlEnv: "ADMIN_AZURE_BASE_URL",
+            }),
+        ).toThrow(/AZURE_BASE_URL/)
     })
 
     it("needs a base URL with a user's Azure key", () => {

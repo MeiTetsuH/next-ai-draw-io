@@ -1,4 +1,25 @@
 const iframe = document.getElementById('drawio');
+// Every API request carries the token the server wrote into this page. A 403
+// means another MCP process (with its own token) now answers on this port:
+// read its token from a fresh copy of this page and retry once, so the next
+// poll can recover the session instead of being refused forever.
+let tokenRefresh = null;
+function refreshToken() {
+    if (!tokenRefresh) {
+        tokenRefresh = fetch(location.href, { cache: 'no-store' })
+            .then((r) => r.text())
+            .then((html) => { const m = html.match(/API_TOKEN = "([0-9a-f]+)"/); if (m) API_TOKEN = m[1]; })
+            .catch(() => {})
+            .finally(() => { tokenRefresh = null; });
+    }
+    return tokenRefresh;
+}
+async function api(url, init = {}) {
+    const send = () => fetch(url, { ...init, headers: { ...(init.headers || {}), 'X-Drawio-Token': API_TOKEN } });
+    let r = await send();
+    if (r.status === 403) { await refreshToken(); r = await send(); }
+    return r;
+}
 let currentVersion = 0, isReady = false, pendingXml = null, lastXml = null;
 // The server state this tab is in step with (see stateId in http-server.ts);
 // null until the first poll
@@ -82,7 +103,7 @@ window.addEventListener('message', (e) => {
                     // result: a poll answered before that still sees the
                     // request and would start the same export again.
                     const seq = msg.message.mcpExport;
-                    fetch('/api/state', {
+                    api('/api/state', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ sessionId, exportData: d, exportId: mcpExportId })
@@ -126,7 +147,7 @@ window.addEventListener('message', (e) => {
                 const t = thumbExport;
                 if (!t || msg.message.thumbExport !== t.n || latestXml !== t.xml) return;
                 thumbExport = null;
-                fetch('/api/history-svg', {
+                api('/api/history-svg', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ sessionId, svg, stateId: t.stateId, version: t.version })
@@ -184,7 +205,7 @@ async function pushState(xml, svg = '', baseVersion = currentVersion, source = '
     if (!sessionId) return;
     pushesInFlight.push(xml);
     try {
-        const r = await fetch('/api/state', {
+        const r = await api('/api/state', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ sessionId, xml, svg, baseVersion, source, stateId: sid })
@@ -237,6 +258,8 @@ async function pushState(xml, svg = '', baseVersion = currentVersion, source = '
 // process restarted. Decide whose diagram wins.
 function recoverState(s) {
     stateId = s.stateId;
+    // History entries got new ids with the new state: an open list is stale
+    if (historyModal.classList.contains('open')) cancelBtn.onclick();
     // The old state's pending work is gone with it
     const projectionShown = projectionExportActive;
     projectionExportActive = false;
@@ -280,7 +303,7 @@ async function poll() {
     if (!sessionId) return;
     const seq = ++pollSeq;
     try {
-        const r = await fetch('/api/state?sessionId=' + encodeURIComponent(sessionId));
+        const r = await api('/api/state?sessionId=' + encodeURIComponent(sessionId));
         if (!r.ok) return;
         const s = await r.json();
         // An older answer than one already handled (the interval, the 409
@@ -298,11 +321,13 @@ async function poll() {
         // The tab's own push still on its way is not loaded back: the
         // canvas may have moved on since (an undo), and its answer follows
         const ownPush = pushesInFlight.includes(s.xml);
+        let justLoaded = false; // this poll put a new version on the canvas
         if ((forceReload || (s.version > currentVersion && !projectionExportActive && !ownPush)) && s.xml) {
             forceReload = false;
             projectionExportActive = false;
             currentVersion = s.version;
             loadDiagram(s.xml, true);
+            justLoaded = true;
         }
         // Handle sync request - server needs fresh state. After the load
         // above, so draw.io exports what it just loaded; never while a
@@ -337,12 +362,14 @@ async function poll() {
             const extra = s.exportOptions || {};
             const fireExport = () => {
                 // mcpExport carries this export's number and is echoed
-                // back in msg.message (see the handler). PNG: width
-                // caps the size, pageId picks a page; without one
-                // draw.io would use the first page.
+                // back in msg.message (see the handler). The server's
+                // options go to draw.io as they are: the margin and
+                // background, for PNG also width (caps the size) and
+                // pageId (picks a page; without one draw.io would use
+                // the first page).
                 const exportOpts = pendingMcpExport === 'png'
                     ? { action: 'export', format: 'png', scale: 2, currentPage: !extra.pageId, ...extra, mcpExport: seq }
-                    : { action: 'export', format: pendingMcpExport, mcpExport: seq };
+                    : { action: 'export', format: pendingMcpExport, ...extra, mcpExport: seq };
                 iframe.contentWindow.postMessage(JSON.stringify(exportOpts), '*');
             };
             if (s.exportXml) {
@@ -351,6 +378,10 @@ async function poll() {
                 iframe.contentWindow.postMessage(JSON.stringify({ action: 'load', xml: s.exportXml, autosave: 0 }), '*');
                 // Let draw.io render the loaded page before exporting
                 // (same proven settle delay as the AI-preview path).
+                setTimeout(fireExport, 600);
+            } else if (justLoaded) {
+                // A write with a screenshot: give the new diagram's external
+                // icon images a moment to load before the PNG is taken
                 setTimeout(fireExport, 600);
             } else {
                 fireExport();
@@ -453,18 +484,24 @@ const historyGrid = document.getElementById('history-grid');
 const historyEmpty = document.getElementById('history-empty');
 const restoreBtn = document.getElementById('restore-btn');
 const cancelBtn = document.getElementById('cancel-btn');
-let historyData = [], selectedId = null;
+// historyStateId: the server state the list belongs to, sent with a restore
+let historyData = [], historyStateId = null, selectedId = null;
 
 historyBtn.onclick = async () => {
     if (!sessionId) return;
+    // A list for a state the server recreated meanwhile has old ids
+    const sid = stateId;
     try {
-        const r = await fetch('/api/history?sessionId=' + encodeURIComponent(sessionId));
+        const r = await api('/api/history?sessionId=' + encodeURIComponent(sessionId));
         if (r.ok) {
             const d = await r.json();
+            if (sid !== stateId) return;
             historyData = d.entries || [];
+            historyStateId = sid;
             renderHistory();
         }
     } catch {}
+    if (sid !== stateId) return;
     historyModal.classList.add('open');
 };
 
@@ -515,12 +552,13 @@ restoreBtn.onclick = async () => {
     restoreBtn.disabled = true;
     restoreBtn.textContent = 'Restoring...';
     try {
-        const r = await fetch('/api/restore', {
+        const r = await api('/api/restore', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sessionId, id: selectedId })
+            body: JSON.stringify({ sessionId, id: selectedId, stateId: historyStateId })
         });
         if (r.ok) { cancelBtn.onclick(); await poll(); }
+        else if (r.status === 409) { cancelBtn.onclick(); showNotice('History changed on the server. Please open it again.'); }
         else { showNotice('Restore failed. Please try again.'); }
     } catch { showNotice('Restore failed. Please try again.'); }
     restoreBtn.textContent = 'Restore';

@@ -1,5 +1,5 @@
-import { expect, type Page, test } from "@playwright/test"
-import { getIframe } from "./lib/fixtures"
+import { expect, type Locator, type Page, test } from "@playwright/test"
+import { changeInAnotherTab, openApp, savedModelConfigs } from "./lib/fixtures"
 
 // qwen-mt-plus is a translation model; models.dev lists no tool calls for it
 const CONFIG = {
@@ -14,21 +14,25 @@ const CONFIG = {
     ],
 }
 
+/** Show a provider's page, going back to the provider list first */
+async function showProvider(dialog: Locator, id: string) {
+    const back = dialog.locator("header button", { hasText: /^(Models|模型)$/ })
+    if (await back.count()) await back.click()
+    await dialog.getByTestId(`provider-row-${id}`).click()
+}
+
 async function openQwenSettings(page: Page, config: object = CONFIG) {
-    await page.addInitScript((config) => {
-        localStorage.setItem(
-            "next-ai-draw-io-model-configs",
-            JSON.stringify(config),
-        )
-    }, config)
-    await page.goto("/", { waitUntil: "networkidle" })
-    await getIframe(page).waitFor({ state: "visible", timeout: 30000 })
-    await page.locator("button:has(svg.lucide-bot)").first().click()
+    await openApp(page, { config })
+    await page.getByTestId("model-selector").click()
     await page.getByText("Configure Models...").click()
     const dialog = page.locator('[role="dialog"]')
-    await dialog.getByText("Qwen (Alibaba)").first().click()
+    await showProvider(dialog, "p1")
     return dialog
 }
+
+const fetchButton = (dialog: Locator) =>
+    dialog.getByRole("button", { name: /^Get all models from/ })
+const testButton = (dialog: Locator) => dialog.getByTestId("test-models")
 
 test("fetches the provider's models and adds one from the picker", async ({
     page,
@@ -51,9 +55,7 @@ test("fetches the provider's models and adds one from the picker", async ({
         dialog.getByText("may not be able to draw").first(),
     ).toBeVisible()
 
-    await dialog
-        .getByRole("button", { name: "Fetch models from the provider" })
-        .click()
+    await fetchButton(dialog).click()
     const picker = page.locator('[role="listbox"]')
     await expect(picker.getByText("qwen-new-max")).toBeVisible()
     await expect(
@@ -64,6 +66,46 @@ test("fetches the provider's models and adds one from the picker", async ({
     await page.getByPlaceholder("Search models...").fill("new-max")
     await picker.getByText("qwen-new-max").click()
     await expect(dialog.locator('input[title="qwen-new-max"]')).toBeVisible()
+})
+
+test("marks models that cannot read images", async ({ page }) => {
+    await page.route("**/api/provider-models", async (route) => {
+        await route.fulfill({
+            json: {
+                models: [
+                    { id: "glm-4.7", tools: true },
+                    { id: "glm-5.3-flash", tools: true },
+                ],
+            },
+        })
+    })
+    // models.dev lists glm-4.6 as text only, glm-4.6v and glm-5.3-flash with images
+    const dialog = await openQwenSettings(page, {
+        version: 1,
+        providers: [
+            {
+                id: "p1",
+                provider: "glm",
+                apiKey: "test-key",
+                models: [
+                    { id: "m1", modelId: "glm-4.6" },
+                    { id: "m2", modelId: "glm-4.6v" },
+                ],
+            },
+        ],
+    })
+    await expect(
+        dialog.getByText("a message with an image will fail"),
+    ).toHaveCount(1)
+
+    await fetchButton(dialog).click()
+    const picker = page.locator('[role="listbox"]')
+    await expect(
+        picker.getByRole("option", { name: /glm-4\.7/ }),
+    ).toContainText("no images")
+    await expect(
+        picker.getByRole("option", { name: /glm-5\.3-flash/ }),
+    ).not.toContainText("no images")
 })
 
 test("the model picker scrolls with the mouse wheel", async ({ page }) => {
@@ -79,9 +121,7 @@ test("the model picker scrolls with the mouse wheel", async ({ page }) => {
         }),
     )
     const dialog = await openQwenSettings(page)
-    await dialog
-        .getByRole("button", { name: "Fetch models from the provider" })
-        .click()
+    await fetchButton(dialog).click()
     const list = page.locator("[cmdk-list]")
     await expect(list.getByText("qwen-model-0")).toBeVisible()
     await list.hover()
@@ -99,12 +139,10 @@ test("shows a hint when the provider rejects the key", async ({ page }) => {
         }),
     )
     const dialog = await openQwenSettings(page)
-    await dialog
-        .getByRole("button", { name: "Fetch models from the provider" })
-        .click()
+    await fetchButton(dialog).click()
     await expect(
         dialog.getByText(
-            "The provider rejected the API key. Check it in model settings. Incorrect API key",
+            "The provider rejected this API key. It may be mistyped, expired, revoked, or from another account. To make a new one, use Get API key.",
         ),
     ).toBeVisible()
 })
@@ -123,12 +161,10 @@ test("a fetch error stays with its provider", async ({ page }) => {
             { id: "p2", provider: "glm", apiKey: "k", models: [] },
         ],
     })
-    await dialog
-        .getByRole("button", { name: "Fetch models from the provider" })
-        .click()
-    const error = dialog.getByText("Incorrect API key")
+    await fetchButton(dialog).click()
+    const error = dialog.getByText("The provider rejected this API key.")
     await expect(error).toBeVisible()
-    await dialog.getByText("GLM (Zhipu)").first().click()
+    await showProvider(dialog, "p2")
     await expect(error).toHaveCount(0)
 })
 
@@ -190,13 +226,16 @@ test("a model list that arrives after switching provider stays with its provider
         error: "Incorrect API key",
     })
     const dialog = await openQwenSettings(page, TWO_PROVIDERS)
-    await dialog
-        .getByRole("button", { name: "Fetch models from the provider" })
-        .click()
-    await dialog.getByText("GLM (Zhipu)").first().click()
+    await fetchButton(dialog).click()
+    await showProvider(dialog, "p2")
+    // The wait counts from the answer, so a slow one cannot pass early
+    const answered = page.waitForResponse("**/api/provider-models")
     release()
+    await answered
     await page.waitForTimeout(500)
-    await expect(dialog.getByText("Incorrect API key")).toHaveCount(0)
+    await expect(
+        dialog.getByText("The provider rejected this API key."),
+    ).toHaveCount(0)
 })
 
 test("a test result that arrives after switching provider stays with its provider", async ({
@@ -207,13 +246,11 @@ test("a test result that arrives after switching provider stays with its provide
         error: "Model not found",
     })
     const dialog = await openQwenSettings(page, TWO_PROVIDERS)
-    await dialog.getByRole("button", { name: "Test", exact: true }).click()
-    await dialog.getByText("GLM (Zhipu)").first().click()
+    await testButton(dialog).click()
+    await showProvider(dialog, "p2")
     release()
     await page.waitForTimeout(500)
-    await expect(dialog.getByText(/model\(s\) failed validation/)).toHaveCount(
-        0,
-    )
+    await expect(dialog.getByText(/failed the test/)).toHaveCount(0)
 })
 
 test("a test result does not count for a model id changed meanwhile", async ({
@@ -224,13 +261,13 @@ test("a test result does not count for a model id changed meanwhile", async ({
         responseTime: 1000,
     })
     const dialog = await openQwenSettings(page, TWO_PROVIDERS)
-    await dialog.getByRole("button", { name: "Test", exact: true }).click()
+    await testButton(dialog).click()
     const input = dialog.locator('input[title="qwen-max"]')
     await input.fill("qwen-plus")
     await input.blur()
     release()
     await page.waitForTimeout(500)
-    await expect(dialog.locator('[title="1.0 s"]')).toHaveCount(0)
+    await expect(dialog.getByText("Works · 1.0 s")).toHaveCount(0)
 })
 
 test("a model list fetched with an old API key is dropped", async ({
@@ -240,9 +277,7 @@ test("a model list fetched with an old API key is dropped", async ({
         models: [{ id: "model-of-old-key", tools: true }],
     })
     const dialog = await openQwenSettings(page, TWO_PROVIDERS)
-    await dialog
-        .getByRole("button", { name: "Fetch models from the provider" })
-        .click()
+    await fetchButton(dialog).click()
     // The user corrects the key while the list is loading
     await dialog.locator("#api-key").fill("new-key")
     release()
@@ -256,25 +291,16 @@ test("a test result for an old API key is dropped", async ({ page }) => {
         responseTime: 1000,
     })
     const dialog = await openQwenSettings(page, TWO_PROVIDERS)
-    await dialog.getByRole("button", { name: "Test", exact: true }).click()
+    await testButton(dialog).click()
     // Another tab saves a different key for this provider
-    await page.evaluate(() => {
-        const key = "next-ai-draw-io-model-configs"
-        const config = JSON.parse(localStorage.getItem(key) ?? "{}")
+    await changeInAnotherTab(page, (config) => {
         config.providers[0].apiKey = "key-from-another-tab"
-        const value = JSON.stringify(config)
-        localStorage.setItem(key, value)
-        window.dispatchEvent(
-            new StorageEvent("storage", { key, newValue: value }),
-        )
     })
     release()
     await page.waitForTimeout(500)
-    await expect(dialog.locator('[title="1.0 s"]')).toHaveCount(0)
+    await expect(dialog.getByText("Works · 1.0 s")).toHaveCount(0)
     // The test is over: the button works again and nothing spins
-    await expect(
-        dialog.getByRole("button", { name: "Test", exact: true }),
-    ).toBeEnabled()
+    await expect(testButton(dialog)).toBeEnabled()
     await expect(dialog.locator(".animate-spin")).toHaveCount(0)
 })
 
@@ -289,17 +315,17 @@ test("an older test does not end a newer one's spinners", async ({ page }) => {
         })
     })
     const dialog = await openQwenSettings(page, TWO_PROVIDERS)
-    await dialog.getByRole("button", { name: "Test", exact: true }).click()
+    await testButton(dialog).click()
     await expect.poll(() => releases.length).toBe(1)
     // The user corrects the key and tests again
     await dialog.locator("#api-key").fill("new-key")
-    await dialog.getByRole("button", { name: "Test", exact: true }).click()
+    await testButton(dialog).click()
     await expect.poll(() => releases.length).toBe(2)
     releases[0]()
     await page.waitForTimeout(500)
     await expect(dialog.locator(".animate-spin").first()).toBeVisible()
     releases[1]()
-    await expect(dialog.locator('[title="1.0 s"]')).toHaveCount(1)
+    await expect(dialog.getByText("Works · 1.0 s")).toHaveCount(1)
 })
 
 test("an older test touches nothing, also when the key came back", async ({
@@ -316,19 +342,19 @@ test("an older test touches nothing, also when the key came back", async ({
         })
     })
     const dialog = await openQwenSettings(page, TWO_PROVIDERS)
-    await dialog.getByRole("button", { name: "Test", exact: true }).click()
+    await testButton(dialog).click()
     await expect.poll(() => releases.length).toBe(1)
     // The key changes and comes back, and the user tests again
     await dialog.locator("#api-key").fill("other-key")
     await dialog.locator("#api-key").fill("test-key")
-    await dialog.getByRole("button", { name: "Test", exact: true }).click()
+    await testButton(dialog).click()
     await expect.poll(() => releases.length).toBe(2)
     releases[0]()
     await page.waitForTimeout(500)
     await expect(dialog.locator(".animate-spin").first()).toBeVisible()
-    await expect(dialog.locator('[title="9.0 s"]')).toHaveCount(0)
+    await expect(dialog.getByText("Works · 9.0 s")).toHaveCount(0)
     releases[1]()
-    await expect(dialog.locator('[title="1.0 s"]')).toHaveCount(1)
+    await expect(dialog.getByText("Works · 1.0 s")).toHaveCount(1)
 })
 
 test("no spinner stays after another tab's change while elsewhere", async ({
@@ -339,21 +365,189 @@ test("no spinner stays after another tab's change while elsewhere", async ({
         responseTime: 1000,
     })
     const dialog = await openQwenSettings(page, TWO_PROVIDERS)
-    await dialog.getByRole("button", { name: "Test", exact: true }).click()
+    await testButton(dialog).click()
     // The user looks at the other provider while another tab changes the key
-    await dialog.getByText("GLM (Zhipu)").first().click()
-    await page.evaluate(() => {
-        const key = "next-ai-draw-io-model-configs"
-        const config = JSON.parse(localStorage.getItem(key) ?? "{}")
+    await showProvider(dialog, "p2")
+    await changeInAnotherTab(page, (config) => {
         config.providers[0].apiKey = "key-from-another-tab"
-        const value = JSON.stringify(config)
-        localStorage.setItem(key, value)
-        window.dispatchEvent(
-            new StorageEvent("storage", { key, newValue: value }),
-        )
     })
     release()
     await page.waitForTimeout(500)
-    await dialog.getByText("Qwen (Alibaba)").first().click()
+    await showProvider(dialog, "p1")
     await expect(dialog.locator(".animate-spin")).toHaveCount(0)
+})
+
+test("a test result that arrives after the settings closed is kept", async ({
+    page,
+}) => {
+    const release = await holdRoute(page, "**/api/validate-model", {
+        valid: true,
+        responseTime: 1000,
+    })
+    const dialog = await openQwenSettings(page, TWO_PROVIDERS)
+    await testButton(dialog).click()
+    await page.keyboard.press("Escape")
+    await expect(dialog).toHaveCount(0)
+    release()
+    await expect
+        .poll(
+            async () =>
+                (await savedModelConfigs(page)).providers[0].models[0]
+                    .validated,
+        )
+        .toBe(true)
+})
+
+test("a test result for a key changed on another settings tab is dropped", async ({
+    page,
+}) => {
+    const release = await holdRoute(page, "**/api/validate-model", {
+        valid: true,
+        responseTime: 1000,
+    })
+    const dialog = await openQwenSettings(page, TWO_PROVIDERS)
+    await testButton(dialog).click()
+    // The panel goes away while the test runs, then the key changes
+    await page.locator('[data-testid="settings-tab-general"]').click()
+    await page.locator('[data-testid="settings-tab-models"]').click()
+    await showProvider(dialog, "p1")
+    await dialog.locator("input[type=password]").first().fill("new-key")
+    release()
+    await page.waitForTimeout(800)
+    const saved = await savedModelConfigs(page)
+    expect(saved.providers[0].apiKey).toBe("new-key")
+    expect(saved.providers[0].models[0].validated).not.toBe(true)
+})
+
+test("a test result for a model renamed on another settings tab is dropped", async ({
+    page,
+}) => {
+    const release = await holdRoute(page, "**/api/validate-model", {
+        valid: true,
+        responseTime: 1000,
+    })
+    const dialog = await openQwenSettings(page, TWO_PROVIDERS)
+    await testButton(dialog).click()
+    // The panel goes away while the test runs, then the model id changes
+    await page.locator('[data-testid="settings-tab-general"]').click()
+    await page.locator('[data-testid="settings-tab-models"]').click()
+    await showProvider(dialog, "p1")
+    const input = dialog.locator('input[title="qwen-max"]')
+    await input.fill("qwen-plus")
+    await input.blur()
+    release()
+    await page.waitForTimeout(800)
+    const saved = await savedModelConfigs(page)
+    expect(saved.providers[0].models[0].modelId).toBe("qwen-plus")
+    expect(saved.providers[0].models[0].validated).not.toBe(true)
+})
+
+test("a failed test speaks the page's language", async ({ page }) => {
+    await page.route("**/api/validate-model", (route) => route.abort())
+    await openApp(page, { path: "/zh", config: TWO_PROVIDERS })
+    await page.getByTestId("settings-button").first().click()
+    const dialog = page.locator('[role="dialog"]')
+    await showProvider(dialog, "p1")
+    await testButton(dialog).click()
+    // The visible line, not the screen reader's copy
+    await expect(
+        dialog
+            .getByText("1 个模型没通过测试")
+            .and(dialog.locator(':not([role="status"])')),
+    ).toBeVisible()
+    await expect(
+        dialog.getByText("网络错误。请检查您的连接。").first(),
+    ).toBeAttached()
+})
+
+test("testing a provider without models speaks the page's language", async ({
+    page,
+}) => {
+    await openApp(page, {
+        path: "/zh",
+        config: {
+            version: 1,
+            providers: [{ ...CONFIG.providers[0], models: [] }],
+        },
+    })
+    await page.getByTestId("settings-button").first().click()
+    const dialog = page.locator('[role="dialog"]')
+    await showProvider(dialog, "p1")
+    // Nothing to test yet: the button says what is missing
+    await expect(testButton(dialog)).toBeDisabled()
+    await expect(dialog.getByText("先添加一个模型。")).toBeVisible()
+})
+
+test("adding a model id twice is refused in the page's language", async ({
+    page,
+}) => {
+    await openApp(page, { path: "/zh", config: CONFIG })
+    await page.getByTestId("settings-button").first().click()
+    const dialog = page.locator('[role="dialog"]')
+    await showProvider(dialog, "p1")
+    const input = dialog.getByPlaceholder("或者输入其他模型 ID")
+    await input.fill("qwen-mt-plus")
+    await input.press("Enter")
+    await expect(dialog.getByText("此模型 ID 已存在")).toBeVisible()
+})
+
+test("Bedrock can be tested and used with an API key alone", async ({
+    page,
+}) => {
+    const bodies: any[] = []
+    await page.route("**/api/validate-model", async (route) => {
+        bodies.push(route.request().postDataJSON())
+        await route.fulfill({
+            status: 200,
+            json: { valid: true, responseTime: 900 },
+        })
+    })
+    await openApp(page, {
+        config: {
+            version: 1,
+            providers: [
+                {
+                    id: "b1",
+                    provider: "bedrock",
+                    awsRegion: "us-east-1",
+                    models: [{ id: "m1", modelId: "amazon.nova-lite-v1:0" }],
+                },
+            ],
+        },
+    })
+    await page.getByTestId("model-selector").click()
+    await page.getByText("Configure Models...").click()
+    const dialog = page.locator('[role="dialog"]')
+    await showProvider(dialog, "b1")
+    const test = testButton(dialog)
+    await expect(test).toBeDisabled()
+    await dialog.getByLabel("Bedrock API key").fill("bedrock-api-key")
+    await expect(test).toBeEnabled()
+    await test.click()
+    await expect.poll(() => bodies.length).toBe(1)
+    expect(bodies[0]).toMatchObject({
+        provider: "bedrock",
+        apiKey: "bedrock-api-key",
+        awsRegion: "us-east-1",
+    })
+
+    // The chat sends it with the request
+    let headers: Record<string, string> = {}
+    await page.route("**/api/chat", async (route) => {
+        headers = route.request().headers()
+        await route.fulfill({
+            status: 200,
+            contentType: "text/event-stream",
+            body: 'data: {"type":"start"}\n\ndata: {"type":"finish"}\n\ndata: [DONE]\n\n',
+        })
+    })
+    await page.keyboard.press("Escape")
+    await page.getByTestId("model-selector").click()
+    await page.getByText("amazon.nova-lite-v1:0").first().click()
+    const input = page.getByTestId("chat-input")
+    await input.fill("Hello")
+    await input.press("ControlOrMeta+Enter")
+    await expect.poll(() => headers["x-ai-api-key"]).toBe("bedrock-api-key")
+    expect(headers["x-ai-provider"]).toBe("bedrock")
+    expect(headers["x-aws-region"]).toBe("us-east-1")
 })

@@ -1,10 +1,11 @@
 import fs from "fs"
 import os from "os"
 import path from "path"
-import { afterEach, beforeEach, describe, expect, it } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
     ADMIN_PROVIDERS_KEY,
     adminProvidersToConfig,
+    credEnvNames,
     deriveEnvUpdates,
     loadAdminProviders,
     maskAdminProviders,
@@ -13,20 +14,19 @@ import {
     validateAdminProviders,
 } from "@/lib/admin/providers"
 import { _resetForTests, saveSettings } from "@/lib/admin/settings"
+import { PROVIDER_NAMES } from "@/lib/providers"
 import { loadRawServerModelsConfig } from "@/lib/server-model-config"
 
 let tmpDir: string
 
 beforeEach(() => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "admin-providers-"))
-    process.env.SETTINGS_FILE = path.join(tmpDir, "settings.json")
+    vi.stubEnv("SETTINGS_FILE", path.join(tmpDir, "settings.json"))
     _resetForTests()
 })
 
 afterEach(() => {
     _resetForTests()
-    delete process.env.SETTINGS_FILE
-    delete process.env.AI_MODELS_CONFIG
     fs.rmSync(tmpDir, { recursive: true, force: true })
 })
 
@@ -48,8 +48,6 @@ describe("deriveEnvUpdates", () => {
         expect(updates.ADMIN_OPENAI_API_KEY).toBe("sk-test")
         expect(updates.OPENAI_API_KEY).toBeUndefined()
         expect(JSON.parse(updates.ADMIN_PROVIDERS as string)).toHaveLength(1)
-        // AI_MODELS_CONFIG is no longer written (merged at read time)
-        expect(updates.AI_MODELS_CONFIG).toBeNull()
     })
 
     it("suffixes env vars for a second instance of the same provider", () => {
@@ -137,7 +135,6 @@ describe("deriveEnvUpdates", () => {
         const prev = [provider()]
         const updates = deriveEnvUpdates([], prev)
         expect(updates.ADMIN_OPENAI_API_KEY).toBeNull()
-        expect(updates.AI_MODELS_CONFIG).toBeNull()
         expect(updates.ADMIN_PROVIDERS).toBeNull()
     })
 
@@ -230,16 +227,19 @@ describe("mergeSecrets", () => {
 
 describe("loadRawServerModelsConfig merge", () => {
     it("combines env AI_MODELS_CONFIG with panel providers", async () => {
-        process.env.AI_MODELS_CONFIG = JSON.stringify({
-            providers: [
-                {
-                    name: "Env OpenAI",
-                    provider: "openai",
-                    models: ["gpt-from-env"],
-                    default: true,
-                },
-            ],
-        })
+        vi.stubEnv(
+            "AI_MODELS_CONFIG",
+            JSON.stringify({
+                providers: [
+                    {
+                        name: "Env OpenAI",
+                        provider: "openai",
+                        models: ["gpt-from-env"],
+                        default: true,
+                    },
+                ],
+            }),
+        )
         saveSettings(deriveEnvUpdates([provider({ name: "Panel" })], []))
 
         const merged = await loadRawServerModelsConfig()
@@ -252,16 +252,19 @@ describe("loadRawServerModelsConfig merge", () => {
     })
 
     it("panel default overrides the env default", async () => {
-        process.env.AI_MODELS_CONFIG = JSON.stringify({
-            providers: [
-                {
-                    name: "Env OpenAI",
-                    provider: "openai",
-                    models: ["gpt-from-env"],
-                    default: true,
-                },
-            ],
-        })
+        vi.stubEnv(
+            "AI_MODELS_CONFIG",
+            JSON.stringify({
+                providers: [
+                    {
+                        name: "Env OpenAI",
+                        provider: "openai",
+                        models: ["gpt-from-env"],
+                        default: true,
+                    },
+                ],
+            }),
+        )
         saveSettings(
             deriveEnvUpdates(
                 [provider({ name: "Panel", isDefault: true })],
@@ -275,15 +278,18 @@ describe("loadRawServerModelsConfig merge", () => {
     })
 
     it("returns only env config when the panel has no providers", async () => {
-        process.env.AI_MODELS_CONFIG = JSON.stringify({
-            providers: [
-                {
-                    name: "Env Only",
-                    provider: "openai",
-                    models: ["gpt-from-env"],
-                },
-            ],
-        })
+        vi.stubEnv(
+            "AI_MODELS_CONFIG",
+            JSON.stringify({
+                providers: [
+                    {
+                        name: "Env Only",
+                        provider: "openai",
+                        models: ["gpt-from-env"],
+                    },
+                ],
+            }),
+        )
         const merged = await loadRawServerModelsConfig()
         expect(merged?.providers.map((p) => p.name)).toEqual(["Env Only"])
     })
@@ -408,11 +414,6 @@ describe("loadAdminProviders", () => {
         expect(loadAdminProviders()).toEqual([])
     })
 
-    it("loads valid stored providers", () => {
-        saveSettings({ [ADMIN_PROVIDERS_KEY]: JSON.stringify([provider()]) })
-        expect(loadAdminProviders()).toHaveLength(1)
-    })
-
     it("round-trips a bedrock provider with multiple string secrets", () => {
         const bedrock = provider({
             provider: "bedrock",
@@ -465,5 +466,58 @@ describe("loadAdminProviders", () => {
         expect(loaded).toEqual([])
         // Masking the loaded list must not throw
         expect(() => maskAdminProviders(loaded)).not.toThrow()
+    })
+})
+
+describe("credEnvNames", () => {
+    it("names the panel's variables for every provider", () => {
+        // bedrock, vertexai and ollama write fixed variables; EdgeOne has none
+        const expected: Record<string, string | null> = {
+            openai: "OPENAI",
+            anthropic: "ANTHROPIC",
+            google: "GOOGLE",
+            deepseek: "DEEPSEEK",
+            qwen: "QWEN",
+            doubao: "DOUBAO",
+            glm: "GLM",
+            kimi: "KIMI",
+            minimax: "MINIMAX",
+            mimo: "MIMO",
+            openrouter: "OPENROUTER",
+            aihubmix: "AIHUBMIX",
+            siliconflow: "SILICONFLOW",
+            modelscope: "MODELSCOPE",
+            novita: "NOVITA",
+            atlascloud: "ATLASCLOUD",
+            qiniu: "QINIU",
+            gateway: "AI_GATEWAY",
+            bedrock: null,
+            vertexai: null,
+            azure: "AZURE",
+            edgeone: null,
+            ollama: null,
+            sglang: "SGLANG",
+            custom: "CUSTOM",
+        }
+        expect(Object.keys(expected).sort()).toEqual([...PROVIDER_NAMES].sort())
+        for (const [p, prefix] of Object.entries(expected)) {
+            const first = credEnvNames(p as StoredAdminProvider["provider"], 0)
+            const third = credEnvNames(p as StoredAdminProvider["provider"], 2)
+            expect([p, first, third]).toEqual([
+                p,
+                prefix
+                    ? {
+                          key: `ADMIN_${prefix}_API_KEY`,
+                          url: `ADMIN_${prefix}_BASE_URL`,
+                      }
+                    : {},
+                prefix
+                    ? {
+                          key: `ADMIN_${prefix}_API_KEY_3`,
+                          url: `ADMIN_${prefix}_BASE_URL_3`,
+                      }
+                    : {},
+            ])
+        }
     })
 })

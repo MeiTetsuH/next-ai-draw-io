@@ -4,14 +4,22 @@ on:
   push:
     branches:
       - main
-      - master
-      - dev
     tags:
       - 'v*'
   pull_request:
     branches:
       - main
-      - master
+  # Run it by hand on main when a push did not trigger it (GitHub drops an
+  # event now and then); it then pushes to ECR like a push to main
+  workflow_dispatch:
+
+# One run per branch at a time. On main, deploys that overlapped replaced
+# each other and the earlier ones failed ("rolled back"); now a new run waits
+# for the one in progress, and of several waiting only the newest runs. A new
+# push to a pull request cancels its older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: ghcr.io
@@ -23,6 +31,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Short-lived AWS credentials (OIDC) for the deploy steps below
+      id-token: write
       
     steps:
       - name: Checkout repository
@@ -68,26 +78,73 @@ jobs:
           build-args: |
             NEXT_PUBLIC_SHOW_ABOUT_AND_NOTICE=true
 
-      # Push to AWS ECR for App Runner auto-deploy
+      # The AWS demo belongs to upstream; personal Vercel forks only build GHCR images.
+      # Push to AWS ECR and deploy the demo (an ECS service that Cloudflare
+      # reaches through a tunnel). The role trusts only this repository's
+      # main branch.
       - name: Configure AWS credentials
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: github.repository == 'DayuanJiang/next-ai-draw-io' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: aws-actions/configure-aws-credentials@v5
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/GitHubActions-next-ai-draw-io-deploy
           aws-region: ap-northeast-1
 
       - name: Login to Amazon ECR
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        if: github.repository == 'DayuanJiang/next-ai-draw-io' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Push to ECR (triggers App Runner auto-deploy)
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+      # :latest also still deploys the App Runner service until it is removed
+      - name: Push to ECR
+        if: github.repository == 'DayuanJiang/next-ai-draw-io' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         env:
           REPO_LOWER: ${{ github.repository }}
+          ECR_IMAGE: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-northeast-1.amazonaws.com/next-ai-draw-io
         run: |
           REPO_LOWER=$(echo "$REPO_LOWER" | tr '[:upper:]' '[:lower:]')
           docker pull ghcr.io/${REPO_LOWER}:latest
-          docker tag ghcr.io/${REPO_LOWER}:latest ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-northeast-1.amazonaws.com/next-ai-draw-io:latest
-          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-northeast-1.amazonaws.com/next-ai-draw-io:latest
+          docker tag ghcr.io/${REPO_LOWER}:latest $ECR_IMAGE:latest
+          docker tag ghcr.io/${REPO_LOWER}:latest $ECR_IMAGE:sha-$GITHUB_SHA
+          docker push $ECR_IMAGE:latest
+          docker push $ECR_IMAGE:sha-$GITHUB_SHA
+
+      # The service's current task definition with the new app image: env
+      # vars, size and the tunnel container stay as set in AWS
+      - name: Render the task definition
+        if: github.repository == 'DayuanJiang/next-ai-draw-io' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        id: taskdef
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition-family: next-ai-draw-io
+          container-name: app
+          image: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.ap-northeast-1.amazonaws.com/next-ai-draw-io:sha-${{ github.sha }}
+
+      # The live pages before the deploy, to tell IndexNow afterwards which
+      # ones changed. Never blocks the deploy.
+      - name: Snapshot the site's pages
+        if: github.repository == 'DayuanJiang/next-ai-draw-io' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: node scripts/indexnow.mjs snapshot "$RUNNER_TEMP/pages-before.json"
+
+      # Waits until the new task serves, so a failed deploy fails this run
+      # (ECS also rolls it back)
+      - name: Deploy to ECS
+        if: github.repository == 'DayuanJiang/next-ai-draw-io' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.taskdef.outputs.task-definition }}
+          cluster: default
+          service: next-ai-draw-io
+          wait-for-service-stability: true
+
+      # Bing and the other IndexNow engines recrawl the pages whose text or
+      # head tags changed
+      - name: Tell IndexNow which pages changed
+        if: github.repository == 'DayuanJiang/next-ai-draw-io' && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          if [ -f "$RUNNER_TEMP/pages-before.json" ]; then
+            node scripts/indexnow.mjs submit "$RUNNER_TEMP/pages-before.json"
+          else
+            echo "No snapshot from before the deploy"
+          fi

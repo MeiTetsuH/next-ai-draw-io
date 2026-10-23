@@ -147,7 +147,7 @@ export function wrapCellsInModel(xml: string): string {
  */
 export function normalizeToMxfile(
     xml: string,
-    opts: { pageId?: string; pageName?: string; host?: string } = {},
+    opts: { pageId?: string; pageName?: string } = {},
 ): string | null {
     const trimmed = xml.trim()
     if (!trimmed) return null
@@ -156,9 +156,8 @@ export function normalizeToMxfile(
 
     const pageId = opts.pageId || generatePageId()
     const pageName = opts.pageName || "Page-1"
-    const host = opts.host || "app.diagrams.net"
     const inner = stripXmlDeclaration(trimmed)
-    return `<mxfile host="${escapeAttr(host)}"><diagram id="${escapeAttr(pageId)}" name="${escapeAttr(pageName)}">${inner}</diagram></mxfile>`
+    return `<mxfile host="app.diagrams.net"><diagram id="${escapeAttr(pageId)}" name="${escapeAttr(pageName)}">${inner}</diagram></mxfile>`
 }
 
 /**
@@ -166,14 +165,10 @@ export function normalizeToMxfile(
  * isn't <mxfile> — callers are expected to have run normalizeToMxfile first.
  */
 export function parseMxfile(xml: string): Document | null {
-    try {
-        if (getXmlSyntaxError(xml)) return null
-        const doc = new DOMParser().parseFromString(xml, "text/xml")
-        if (doc.documentElement?.tagName !== "mxfile") return null
-        return doc as unknown as Document
-    } catch {
-        return null
-    }
+    if (getXmlSyntaxError(xml)) return null
+    const doc = new DOMParser().parseFromString(xml, "text/xml")
+    if (doc.documentElement?.tagName !== "mxfile") return null
+    return doc as unknown as Document
 }
 
 /** Serialise an mxfile doc back to a string via the global XMLSerializer polyfill. */

@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test"
-import { getIframe } from "./lib/fixtures"
+import { openApp } from "./lib/fixtures"
 
 // One provider with three models; the test endpoint answers each differently
 const CONFIG = {
@@ -21,12 +21,6 @@ const CONFIG = {
 test("the Test button checks all models at once and shows each result", async ({
     page,
 }) => {
-    await page.addInitScript((config) => {
-        localStorage.setItem(
-            "next-ai-draw-io-model-configs",
-            JSON.stringify(config),
-        )
-    }, CONFIG)
     const started: string[] = []
     await page.route("**/api/validate-model", async (route) => {
         const { modelId } = route.request().postDataJSON()
@@ -45,20 +39,19 @@ test("the Test button checks all models at once and shows each result", async ({
         }
         await route.fulfill({ json: answers[modelId] })
     })
-    await page.goto("/", { waitUntil: "networkidle" })
-    await getIframe(page).waitFor({ state: "visible", timeout: 30000 })
+    await openApp(page, { config: CONFIG })
 
-    await page.locator("button:has(svg.lucide-bot)").first().click()
+    await page.getByTestId("model-selector").click()
     await page.getByText("Configure Models...").click()
     const dialog = page.locator('[role="dialog"]')
-    await dialog.getByText("GLM (Zhipu)").first().click()
-    await dialog.getByRole("button", { name: "Test", exact: true }).click()
+    await dialog.getByTestId("provider-row-p1").click()
+    await dialog.getByTestId("test-models").click()
 
     await expect(
         dialog.getByText("answered without calling a tool"),
     ).toBeVisible({ timeout: 15000 })
     await expect(dialog.getByText("Model not found")).toBeVisible()
-    await expect(dialog.locator('[title="1.2 s"]')).toBeVisible()
+    await expect(dialog.getByText("Works · 1.2 s")).toBeVisible()
     expect(started.sort()).toEqual([
         "model-broken",
         "model-no-tools",
@@ -67,18 +60,11 @@ test("the Test button checks all models at once and shows each result", async ({
 })
 
 test("the key link and the base URL cleanup", async ({ page }) => {
-    await page.addInitScript((config) => {
-        localStorage.setItem(
-            "next-ai-draw-io-model-configs",
-            JSON.stringify(config),
-        )
-    }, CONFIG)
-    await page.goto("/", { waitUntil: "networkidle" })
-    await getIframe(page).waitFor({ state: "visible", timeout: 30000 })
-    await page.locator("button:has(svg.lucide-bot)").first().click()
+    await openApp(page, { config: CONFIG })
+    await page.getByTestId("model-selector").click()
     await page.getByText("Configure Models...").click()
     const dialog = page.locator('[role="dialog"]')
-    await dialog.getByText("GLM (Zhipu)").first().click()
+    await dialog.getByTestId("provider-row-p1").click()
 
     await expect(
         dialog.getByRole("link", { name: "Get API key" }),
@@ -86,6 +72,8 @@ test("the key link and the base URL cleanup", async ({ page }) => {
         "href",
         "https://open.bigmodel.cn/usercenter/proj-mgmt/apikeys",
     )
+    // The base URL is under "More options"
+    await dialog.getByRole("button", { name: /^More options/ }).click()
     const baseUrl = dialog.locator("#base-url")
     await baseUrl.fill("https://proxy.example.com/v4/chat/completions/")
     await baseUrl.blur()

@@ -9,18 +9,15 @@ import {
     readdirSync,
     readFileSync,
     rmSync,
+    statSync,
     utimesSync,
     writeFileSync,
 } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterEach, beforeAll, describe, expect, it } from "vitest"
-import { installDomPolyfill } from "../src/dom.ts"
+import { describe, expect, it, vi } from "vitest"
+import type { HistorySource } from "../src/history.ts"
 import { Autosaver, defaultDataDir } from "../src/persistence.ts"
-
-beforeAll(() => {
-    installDomPolyfill()
-})
 
 const DIAGRAM = `<mxfile><diagram id="p" name="P"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="a" vertex="1" parent="1"/></root></mxGraphModel></diagram></mxfile>`
 const BLANK = `<mxfile><diagram id="page-1" name="Page-1"><mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/></root></mxGraphModel></diagram></mxfile>`
@@ -84,10 +81,14 @@ describe("Autosaver", () => {
             writeFileSync(join(dir, `${id}.drawio`), DIAGRAM)
             utimesSync(join(dir, `${id}.drawio`), 1000 + i, 1000 + i)
         }
+        // A session's History file goes with its diagram
+        writeFileSync(join(dir, "mcp-mgd0a1b2-old123.history.json"), "[]")
+        writeFileSync(join(dir, "mcp-mgd0a1b3-mid456.history.json"), "[]")
         saver.schedule("mcp-mgd0a1b4-new789", DIAGRAM)
         saver.flush()
         expect(readdirSync(dir).sort()).toEqual([
             "mcp-mgd0a1b3-mid456.drawio",
+            "mcp-mgd0a1b3-mid456.history.json",
             "mcp-mgd0a1b4-new789.drawio",
             "mcp-notes.drawio",
             "mcp-system-design-v2.drawio",
@@ -188,29 +189,238 @@ describe("Autosaver", () => {
     it("does nothing when saving is off", () => {
         const saver = new Autosaver(null)
         expect(saver.pathFor("mcp-x")).toBeNull()
+        expect(saver.historyPathFor("mcp-x")).toBeNull()
+        expect(saver.loadHistory("mcp-x")).toEqual([])
         saver.schedule("mcp-x", DIAGRAM)
         saver.flush()
+    })
+
+    it("lists every session file newest first, hand-named ones included", () => {
+        const dir = tempDir()
+        const saver = new Autosaver(dir, 10)
+        const names = [
+            "mcp-mgd0a1b2-old123.drawio",
+            "mine.drawio",
+            "mcp-notes.drawio",
+            "mcp-readme.txt",
+            "mcp-mgd0a1b3-new456.drawio",
+        ]
+        for (const [i, name] of names.entries()) {
+            writeFileSync(join(dir, name), DIAGRAM)
+            utimesSync(join(dir, name), 1000 + i, 1000 + i)
+        }
+        expect(saver.dataDir()).toBe(dir)
+        expect(saver.list()).toEqual([
+            {
+                sessionId: "mcp-mgd0a1b3-new456",
+                path: join(dir, "mcp-mgd0a1b3-new456.drawio"),
+                savedAt: new Date(1004 * 1000),
+            },
+            {
+                sessionId: "mcp-notes",
+                path: join(dir, "mcp-notes.drawio"),
+                savedAt: new Date(1002 * 1000),
+            },
+            {
+                sessionId: "mcp-mgd0a1b2-old123",
+                path: join(dir, "mcp-mgd0a1b2-old123.drawio"),
+                savedAt: new Date(1000 * 1000),
+            },
+        ])
+    })
+
+    it("lists nothing when saving is off or the folder does not exist", () => {
+        const off = new Autosaver(null)
+        expect(off.dataDir()).toBeNull()
+        expect(off.list()).toEqual([])
+        expect(new Autosaver(join(tempDir(), "missing")).list()).toEqual([])
+    })
+})
+
+describe("Autosaver History", () => {
+    const V1 = DIAGRAM.replace('id="a"', 'id="v1"')
+    const V2 = DIAGRAM.replace('id="a"', 'id="v2"')
+    const V3 = DIAGRAM.replace('id="a"', 'id="v3"')
+    // One session's History entries, as history.ts keeps them (the saver
+    // leaves the thumbnails out)
+    const withHistory = (
+        dir: string,
+        entries: { id: number; xml: string; source?: HistorySource }[],
+    ) => new Autosaver(dir, 30, 50, () => entries)
+
+    it("saves the XML of the History entries next to the diagram", async () => {
+        const dir = tempDir()
+        const entries = [
+            { id: 0, xml: V1 },
+            { id: 1, xml: V2 },
+        ]
+        const saver = withHistory(dir, entries)
+        const path = saver.historyPathFor("mcp-h") as string
+        expect(path).toBe(join(dir, "mcp-h.history.json"))
+        saver.schedule("mcp-h", V2)
+        expect(existsSync(path)).toBe(false)
+        await sleep(80)
+        expect(JSON.parse(readFileSync(path, "utf-8"))).toEqual([
+            { xml: V1 },
+            { xml: V2 },
+        ])
+        expect(saver.loadHistory("mcp-h")).toEqual([{ xml: V1 }, { xml: V2 }])
+        expect(readdirSync(dir).sort()).toEqual([
+            "mcp-h.drawio",
+            "mcp-h.history.json",
+        ])
+    })
+
+    it("saves a diagram cleared before its first save, with its History", () => {
+        const dir = tempDir()
+        const saver = withHistory(dir, [{ id: 0, xml: V1 }])
+        saver.schedule("mcp-cleared", BLANK)
+        saver.flush()
+        expect(
+            readFileSync(saver.pathFor("mcp-cleared") as string, "utf-8"),
+        ).toBe(BLANK)
+        expect(saver.loadHistory("mcp-cleared")).toEqual([{ xml: V1 }])
+    })
+
+    it("still skips a blank page whose History holds only blank pages", () => {
+        const dir = tempDir()
+        const saver = withHistory(dir, [{ id: 0, xml: BLANK }])
+        saver.schedule("mcp-empty", BLANK)
+        saver.flush()
+        expect(readdirSync(dir)).toEqual([])
+    })
+
+    it("writes the History again after the cap removed it", () => {
+        const dir = tempDir()
+        const entries = [{ id: 0, xml: V1 }]
+        const saver = new Autosaver(dir, 10, 1, () => entries)
+        const old = "mcp-aaaaaaaa-old"
+        saver.schedule(old, V1)
+        saver.flush()
+        utimesSync(saver.pathFor(old) as string, 1000, 1000)
+        // A newer session pushes the old one out
+        saver.schedule("mcp-aaaaaaab-new", V1)
+        saver.flush()
+        expect(existsSync(saver.historyPathFor(old) as string)).toBe(false)
+        // The old session is still open and saves again, History unchanged
+        saver.schedule(old, V1)
+        saver.flush()
+        expect(saver.loadHistory(old)).toEqual([{ xml: V1 }])
+    })
+
+    it("rewrites the History file only when the entries changed", () => {
+        const dir = tempDir()
+        const entries = [{ id: 0, xml: V1 }]
+        const saver = withHistory(dir, entries)
+        saver.schedule("mcp-same", V1)
+        saver.flush()
+        const path = saver.historyPathFor("mcp-same") as string
+        utimesSync(path, 1000, 1000)
+        const old = statSync(path).mtimeMs
+
+        // draw.io's own autosave of an unchanged diagram
+        saver.schedule("mcp-same", V1)
+        saver.flush()
+        expect(statSync(path).mtimeMs).toBe(old)
+
+        entries.push({ id: 1, xml: V2 })
+        saver.schedule("mcp-same", V2)
+        saver.flush()
+        expect(statSync(path).mtimeMs).not.toBe(old)
+        expect(saver.loadHistory("mcp-same")).toEqual([
+            { xml: V1 },
+            { xml: V2 },
+        ])
+
+        // The circular buffer dropped the oldest entry: same length, new id
+        entries.shift()
+        entries.push({ id: 2, xml: V3 })
+        saver.schedule("mcp-same", V3)
+        saver.flush()
+        expect(saver.loadHistory("mcp-same")).toEqual([
+            { xml: V2 },
+            { xml: V3 },
+        ])
+    })
+
+    it("writes no History file while there are no entries", () => {
+        const dir = tempDir()
+        const saver = withHistory(dir, [])
+        saver.schedule("mcp-empty", DIAGRAM)
+        saver.flush()
+        expect(readdirSync(dir)).toEqual(["mcp-empty.drawio"])
+    })
+
+    it("reads [] for a missing or malformed History file", () => {
+        const dir = tempDir()
+        const saver = new Autosaver(dir, 10)
+        const path = saver.historyPathFor("mcp-bad") as string
+        expect(saver.loadHistory("mcp-bad")).toEqual([])
+        for (const content of [
+            "{not json",
+            '{"a":1}',
+            "[1, 2]",
+            '"x"',
+            '[{"source":"user"}]',
+        ]) {
+            writeFileSync(path, content)
+            expect(saver.loadHistory("mcp-bad")).toEqual([])
+        }
+    })
+
+    it("reads the History files of earlier versions, which hold the XML alone", () => {
+        const dir = tempDir()
+        const saver = new Autosaver(dir, 10)
+        writeFileSync(
+            saver.historyPathFor("mcp-old") as string,
+            JSON.stringify([V1, V2]),
+        )
+        expect(saver.loadHistory("mcp-old")).toEqual([{ xml: V1 }, { xml: V2 }])
+    })
+
+    it("keeps who made each entry, so the shell's cards look the same after a restart", () => {
+        // A clear of the canvas and a restore of it: without the source, the
+        // restored copy would show as a second clear
+        const dir = tempDir()
+        const saver = withHistory(dir, [
+            { id: 0, xml: V1 },
+            { id: 1, xml: BLANK, source: "user" },
+            { id: 2, xml: V2, source: "restore" },
+            { id: 3, xml: V1, source: "recover" },
+            { id: 4, xml: V2, source: "load" },
+            { id: 5, xml: V1, source: "add_page" },
+        ])
+        saver.schedule("mcp-who", V1)
+        saver.flush()
+        expect(saver.loadHistory("mcp-who")).toEqual([
+            { xml: V1 },
+            { xml: BLANK, source: "user" },
+            { xml: V2, source: "restore" },
+            { xml: V1, source: "recover" },
+            { xml: V2, source: "load" },
+            { xml: V1, source: "add_page" },
+        ])
+        // A source the server does not know is left out
+        writeFileSync(
+            saver.historyPathFor("mcp-who") as string,
+            JSON.stringify([{ xml: V1, source: "robot" }]),
+        )
+        expect(saver.loadHistory("mcp-who")).toEqual([{ xml: V1 }])
     })
 })
 
 describe("defaultDataDir", () => {
-    const original = process.env.DRAWIO_DATA_DIR
-    afterEach(() => {
-        if (original === undefined) delete process.env.DRAWIO_DATA_DIR
-        else process.env.DRAWIO_DATA_DIR = original
-    })
-
     it("reads DRAWIO_DATA_DIR, where off disables saving", () => {
-        process.env.DRAWIO_DATA_DIR = "off"
+        vi.stubEnv("DRAWIO_DATA_DIR", "off")
         expect(defaultDataDir()).toBeNull()
-        process.env.DRAWIO_DATA_DIR = "/tmp/x"
+        vi.stubEnv("DRAWIO_DATA_DIR", "/tmp/x")
         expect(defaultDataDir()).toBe("/tmp/x")
-        delete process.env.DRAWIO_DATA_DIR
+        vi.stubEnv("DRAWIO_DATA_DIR", undefined)
         expect(defaultDataDir()).toMatch(/\.next-ai-drawio$/)
     })
 
     it("expands ~, which JSON configs pass on as it is", () => {
-        process.env.DRAWIO_DATA_DIR = "~/drawio-saves"
+        vi.stubEnv("DRAWIO_DATA_DIR", "~/drawio-saves")
         expect(defaultDataDir()).toBe(join(homedir(), "drawio-saves"))
     })
 })

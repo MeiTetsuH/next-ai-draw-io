@@ -1,5 +1,5 @@
 import { expect, type Page, test } from "@playwright/test"
-import { getIframe, sendMessage } from "./lib/fixtures"
+import { getChatInput, openApp, sendMessage } from "./lib/fixtures"
 
 /** Answer the chat request with the given response and send a message */
 async function chatWith(
@@ -7,8 +7,7 @@ async function chatWith(
     response: { status: number; contentType: string; body: string },
 ) {
     await page.route("**/api/chat", (route) => route.fulfill(response))
-    await page.goto("/", { waitUntil: "networkidle" })
-    await getIframe(page).waitFor({ state: "visible", timeout: 30000 })
+    await openApp(page)
     await sendMessage(page, "Draw a box")
 }
 
@@ -32,9 +31,13 @@ test("a rejected key shows a hint, the provider's words and a settings button", 
     // First match: the Next.js dev overlay at the end also lists the error
     await expect(page.getByText("Authentication Fails").first()).toBeVisible()
     await page.getByRole("button", { name: "Open model settings" }).click()
+    // A server model answered: settings opens on the models tab's list
+    const dialog = page.getByRole("dialog", { name: "Settings" })
+    await expect(dialog).toBeVisible()
     await expect(
-        page.getByRole("dialog", { name: "AI Model Configuration" }),
+        dialog.getByRole("heading", { name: "Models", exact: true }),
     ).toBeVisible()
+    await expect(dialog.getByText("Use your own API key")).toBeVisible()
 })
 
 test("an error before the stream shows its text, not raw JSON", async ({
@@ -98,7 +101,40 @@ test("a refused server key shows only the quota hint and a settings button", asy
         0,
     )
     await page.getByRole("button", { name: "Open model settings" }).click()
+    // A server model answered: settings opens on the models tab's list
+    const dialog = page.getByRole("dialog", { name: "Settings" })
+    await expect(dialog).toBeVisible()
     await expect(
-        page.getByRole("dialog", { name: "AI Model Configuration" }),
+        dialog.getByRole("heading", { name: "Models", exact: true }),
     ).toBeVisible()
+    await expect(dialog.getByText("Use your own API key")).toBeVisible()
 })
+
+// The quota toast reads the dictionary: outside its provider it threw and
+// the whole page went to the error screen
+for (const [type, title] of [
+    ["request", "Daily Quota Reached"],
+    ["token", "Daily Token Limit Reached"],
+] as const) {
+    test(`the daily ${type} limit shows its toast and the page stays`, async ({
+        page,
+    }) => {
+        await chatWith(page, {
+            status: 429,
+            contentType: "application/json",
+            body: JSON.stringify({
+                error: "Daily limit exceeded",
+                type,
+                used: 50,
+                limit: 50,
+            }),
+        })
+        await expect(page.getByText(title)).toBeVisible({ timeout: 15000 })
+        await getChatInput(page).fill("Still here")
+        await expect(getChatInput(page)).toHaveValue("Still here")
+        await page.getByRole("button", { name: "Use Your API Key" }).click()
+        await expect(
+            page.getByRole("dialog", { name: "Settings" }),
+        ).toBeVisible()
+    })
+}
