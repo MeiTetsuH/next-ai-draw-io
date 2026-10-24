@@ -141,6 +141,9 @@
         },
         "@tailwindcss/typography": {
             "postcss-selector-parser": "^7.1.6"
+        },
+        "miniflare@5.20261006.1-alpha": {
+            "undici": "7.30.1"
         }
     }
 }
